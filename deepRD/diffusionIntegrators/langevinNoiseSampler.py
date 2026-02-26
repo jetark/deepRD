@@ -35,6 +35,8 @@ class langevinNoiseSampler(langevin):
             part.aux2 = np.zeros(particleList.dimension)
             part.aux3 = np.zeros(particleList.dimension)
             part.aux4 = np.zeros(particleList.dimension)
+            part.q1 = np.zeros(particleList.dimension) # previous timestep position
+
         self.currentOrNext = 'next'
         self.calculateForceField(particleList)
         self.firstRun = False
@@ -782,6 +784,11 @@ class langevinNoiseSamplerDimerGlobal(langevinNoiseSamplerDimer):
             return np.concatenate((self.rotatedVelocity, particle1.aux1, particle2.aux1, particle1.aux2, particle2.aux2))
         elif self.conditionedOn=='piridqi':
             return np.concatenate((particle1.nextVelocity, particle2.nextVelocity, particle1.aux1, particle2.aux1, np.array([self.relDistance[index]])))
+        # Conditionings that utilise a transformation to dimer's local system 
+        elif self.conditionedOn == 'local_dqipiri':
+            return np.concatenate((particle1.nextPosition, particle2.nextPosition, particle1.nextVelocity, particle2.nextVelocity, particle1.aux1, particle2.aux1))
+        elif self.conditionedOn == 'local_dqipipimririm':
+            return np.concatenate((particle1.nextPosition, particle2.nextPosition, particle1.q1, particle2.q1, particle1.nextVelocity, particle2.nextVelocity, particle1.aux3, particle2.aux3, particle1.aux1, particle2.aux1, particle1.aux2, particle2.aux2))
         else:
             sys.stdout.write("Unknown conditioned variables, check getConditionedVars in langevinNoiseSampler.\r")
 
@@ -826,6 +833,10 @@ class langevinNoiseSamplerDimerGlobal(langevinNoiseSamplerDimer):
             ## For testing and consistency.
             #xi = np.sqrt(self.kBT * particle.mass * (1 - np.exp(-2 * self.Gamma * dt / particle.mass)))
             #interactionNoiseTerm = xi / particle.mass * np.random.normal(0., 1, particle.dimension)
+
+            # Saving positions for local frame
+            particleList[2*i].q1 = 1.0 * particleList[2*i].nextPosition
+            particleList[2*i+1].q1 = 1.0 * particleList[2*i+1].nextPosition
 
             # Additional r^(n-2) term
             particleList[2*i].aux4 = 1.0 * particleList[2*i].aux2
