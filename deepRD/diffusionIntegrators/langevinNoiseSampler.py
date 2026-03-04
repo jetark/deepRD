@@ -785,9 +785,9 @@ class langevinNoiseSamplerDimerGlobal(langevinNoiseSamplerDimer):
         elif self.conditionedOn=='piridqi':
             return np.concatenate((particle1.nextVelocity, particle2.nextVelocity, particle1.aux1, particle2.aux1, np.array([self.relDistance[index]])))
         # Conditionings that utilise a transformation to dimer's local system 
-        elif self.conditionedOn == 'local_dqipiri':
+        elif self.conditionedOn in ('local_dqipiri','local_dqipiwiri', 'local_abs_dqipiri'):
             return np.concatenate((particle1.nextPosition, particle2.nextPosition, particle1.nextVelocity, particle2.nextVelocity, particle1.aux1, particle2.aux1))
-        elif self.conditionedOn == 'local_dqipipimririm':
+        elif self.conditionedOn in ('local_dqipipimririm', 'local_abs_dqipipimririm'):
             return np.concatenate((particle1.nextPosition, particle2.nextPosition, particle1.q1, particle2.q1, particle1.nextVelocity, particle2.nextVelocity, particle1.aux3, particle2.aux3, particle1.aux1, particle2.aux1, particle1.aux2, particle2.aux2))
         else:
             sys.stdout.write("Unknown conditioned variables, check getConditionedVars in langevinNoiseSampler.\r")

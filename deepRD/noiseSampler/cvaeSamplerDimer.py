@@ -74,7 +74,10 @@ class CVAE(nn.Module):
             "dimer": {
                 "pipimririm": 24,
                 "local_dqipiri": 13,
-                "local_dqipipimririm": 25
+                "local_abs_dqipiri": 13,
+                "local_dqipiwiri": 14,
+                "local_dqipipimririm": 25,
+                "local_abs_dqipipimririm": 25
             },
         }
 
@@ -194,6 +197,10 @@ class CVAE(nn.Module):
         returns: (..., 6) xyz aux next as [r1_next(3), r2_next(3)]
         """
 
+        rel = True
+        if self.cond_type in ("local_abs_dqipiri", "local_abs_dqipipimririm"):
+            rel=False
+
         # ---- Reshape and normalise ---- #
         c_n_np = np.asarray(c_n_np, dtype=np.float32)
         single_sample = False
@@ -201,7 +208,7 @@ class CVAE(nn.Module):
             c_n_np = c_n_np.reshape(1, -1)
             single_sample = True
 
-        if self.cond_type=="local_dqipiri":
+        if self.cond_type in ("local_dqipiri", "local_dqipiwiri", "local_abs_dqipiri"):
             # unpack
             q1 = c_n_np[:, 0:3]
             q2 = c_n_np[:, 3:6]
@@ -210,7 +217,7 @@ class CVAE(nn.Module):
             r1 = c_n_np[:, 12:15]
             r2 = c_n_np[:, 15:18]
 
-        elif self.cond_type=="local_dqipipimririm":
+        elif self.cond_type in ("local_dqipipimririm", "local_abs_dqipipimririm"):
             # unpack
             q1      = c_n_np[:, 0:3]
             q2      = c_n_np[:, 3:6]
@@ -240,17 +247,11 @@ class CVAE(nn.Module):
         boxsize = 5.0
         R, bond_len = build_local_frame(q1_t, q2_t, boxsize=boxsize)  # R:(B,3,3), bond_len:(B,)
 
-        # rel/com in xyz
-        v_rel_xyz, v_com_xyz = dimer_rel_com(v1_t, v2_t)
-        r_rel_xyz, r_com_xyz = dimer_rel_com(r1_t, r2_t)
-
-        # local
-        v_rel_loc = to_local(R, v_rel_xyz)
-        v_com_loc = to_local(R, v_com_xyz)
-        r_rel_loc = to_local(R, r_rel_xyz)
-        r_com_loc = to_local(R, r_com_xyz)
-
-        if self.cond_type=="local_dqipipimririm":
+        # Converting to local frame
+        v_rel_loc, v_com_loc = dimer_to_local(R, v1_t, v2_t, rel=rel)
+        r_rel_loc, r_com_loc = dimer_to_local(R, r1_t, r2_t, rel=rel)
+        
+        if self.cond_type in ("local_dqipipimririm", "local_abs_dqipipimririm"):
             q1_prev_t = torch.from_numpy(q1_prev).to(device=device)
             q2_prev_t = torch.from_numpy(q2_prev).to(device=device)
             v1_prev_t = torch.from_numpy(v1_prev).to(device=device)
@@ -260,21 +261,20 @@ class CVAE(nn.Module):
 
             # build local frame
             R_prev, bond_len_prev = build_local_frame(q1_prev_t, q2_prev_t, boxsize=boxsize)  # R:(B,3,3), bond_len:(B,)
+            # Converting to local frame          
+            v_rel_prev_loc, v_com_prev_loc = dimer_to_local(R_prev, v1_prev_t, v2_prev_t, rel=rel)
+            r_rel_prev_loc, r_com_prev_loc = dimer_to_local(R_prev, r1_prev_t, r2_prev_t, rel=rel)
+    
 
-            # rel/com in xyz
-            v_rel_prev_xyz, v_com_prev_xyz = dimer_rel_com(v1_prev_t, v2_prev_t)
-            r_rel_prev_xyz, r_com_prev_xyz = dimer_rel_com(r1_prev_t, r2_prev_t)
-
-            # local
-            v_rel_prev_loc = to_local(R_prev, v_rel_prev_xyz)
-            v_com_prev_loc = to_local(R_prev, v_com_prev_xyz)
-            r_rel_prev_loc = to_local(R_prev, r_rel_prev_xyz)
-            r_com_prev_loc = to_local(R_prev, r_com_prev_xyz)
-
-        if self.cond_type=="local_dqipiri":
+        if self.cond_type in ("local_dqipiri", "local_abs_dqipiri"):
             # build model conditioning: [bond_len, v_rel_loc, r_rel_loc, r_com_loc] -> (B,13)
             c_model_t = torch.cat([bond_len.unsqueeze(-1), v_rel_loc, v_com_loc, r_rel_loc, r_com_loc], dim=-1)
-        elif self.cond_type=="local_dqipipimririm":
+        elif self.cond_type=="local_dqipiwiri":
+            # Adding perpendicular velocity
+            v_perp2 = (v_rel_loc[..., 1] ** 2 + v_rel_loc[..., 2] ** 2).unsqueeze(-1)
+            # build model conditioning: [bond_len, v_rel_loc, r_rel_loc, r_com_loc] -> (B,13)
+            c_model_t = torch.cat([bond_len.unsqueeze(-1), v_rel_loc, v_com_loc, v_perp2, r_rel_loc, r_com_loc], dim=-1)
+        elif self.cond_type in ("local_dqipipimririm", "local_abs_dqipipimririm"):
             # build model conditioning: [bond_len, v_loc, v_prev_loc, r_loc, r_prev_loc] -> (B,25)
             c_model_t = torch.cat([bond_len.unsqueeze(-1), v_rel_loc, v_com_loc, v_rel_prev_loc, v_com_prev_loc, 
                                         r_rel_loc, r_com_loc, r_rel_prev_loc, r_com_prev_loc], dim=-1)
@@ -288,12 +288,8 @@ class CVAE(nn.Module):
         r_rel_loc_next = out_loc_t[:, 0:3]
         r_com_loc_next = out_loc_t[:, 3:6]
 
-        # rotate back to xyz
-        r_rel_xyz_next = to_xyz(R, r_rel_loc_next)
-        r_com_xyz_next = to_xyz(R, r_com_loc_next)
-
-        # back to per-particle
-        r1_next, r2_next = dimer_from_rel_com(r_rel_xyz_next, r_com_xyz_next)
+        # Back to xyz frame
+        r1_next, r2_next = dimer_to_xyz(R, r_rel_loc_next, r_com_loc_next, rel=rel)
 
         out_xyz = torch.cat([r1_next, r2_next], dim=-1).detach().cpu().numpy()
         return out_xyz.squeeze(0) if single_sample else out_xyz
@@ -416,14 +412,22 @@ def dimer_from_rel_com(rel: torch.Tensor, com: torch.Tensor) -> tuple[torch.Tens
     a2 = com + 0.5 * rel
     return a1, a2
 
-def dimer_to_local(R: torch.Tensor, a1_xyz: torch.Tensor, a2_xyz: torch.Tensor):
-    rel_xyz, com_xyz = dimer_rel_com(a1_xyz, a2_xyz)
-    rel_loc = to_local(R, rel_xyz)
-    com_loc = to_local(R, com_xyz)
-    return rel_loc, com_loc
+def dimer_to_local(R: torch.Tensor, a1_xyz: torch.Tensor, a2_xyz: torch.Tensor, rel=True):
+    
+    if rel==True:
+        a1_xyz, a2_xyz = dimer_rel_com(a1_xyz, a2_xyz)
+        
+    a1_loc = to_local(R, a1_xyz)
+    a2_loc = to_local(R, a2_xyz)
 
-def dimer_to_xyz(R: torch.Tensor, rel_loc: torch.Tensor, com_loc: torch.Tensor):
-    rel_xyz = to_xyz(R, rel_loc)
-    com_xyz = to_xyz(R, com_loc)
-    a1_xyz, a2_xyz = dimer_from_rel_com(rel_xyz, com_xyz)
+    return a1_loc, a2_loc
+
+def dimer_to_xyz(R: torch.Tensor, a1_loc: torch.Tensor, a2_loc: torch.Tensor, rel=True):
+
+    a1_xyz = to_xyz(R, a1_loc)
+    a2_xyz = to_xyz(R, a2_loc)
+    
+    if rel==True:
+        a1_xyz, a2_xyz = dimer_from_rel_com(a1_xyz, a2_xyz)
+        
     return a1_xyz, a2_xyz
