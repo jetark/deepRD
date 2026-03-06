@@ -1,5 +1,6 @@
 import h5py
 import numpy as np
+import torch
 
 # Functions to load trajectories and manipulate them
 
@@ -413,5 +414,143 @@ def rotateZaxis(vec, theta):
                           [np.sin(theta), np.cos(theta), 0],
                           [0,0,1]])
     return rotMatrix.dot(vec)
+
+### Helper functions for LOCAL FRAME transformation
+def minimal_image_rel(q1, q2, boxsize=None, boundary_type='periodic'):
+    """
+    q1, q2: [..., 3] torch tensors
+    returns q2 - q1 with minimal-image convention matching trajectoryTools.relativePosition
+    """
+    rel = q2 - q1  # [..., 3]
+
+    if boundary_type == "periodic" and boxsize is not None:
+        # box: tensor of shape [3]
+        if isinstance(boxsize, (list, tuple, np.ndarray)):
+            box = torch.tensor(boxsize, dtype=rel.dtype, device=rel.device)
+        else:  # scalar -> same in all dims
+            box = torch.full((3,), float(boxsize), dtype=rel.dtype, device=rel.device)
+
+        # broadcast box over leading dims, minimal image per component
+        rel = rel - box * torch.round(rel / box)
+
+    return rel
+
+def build_local_frame(
+    q1: torch.Tensor,
+    q2: torch.Tensor,
+    boxsize: float = 5.0,
+    eps: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build bond-aligned local orthonormal frame for a dimer.
+
+    Args
+    ----
+    q1, q2 : (..., 3)
+        Particle positions in lab xyz.
+    boxsize : float or (3,)
+        Periodic box size(s) used for minimal image convention.
+    eps : float
+        Numerical epsilon.
+
+    Returns
+    -------
+    R : (..., 3, 3)
+        Rotation matrix whose columns are [e1, e2, e3] in lab coords.
+        For any lab vector v_xyz: v_local = R^T @ v_xyz,  v_xyz = R @ v_local.
+    r : (...,)
+        Bond length ||d|| with minimal image convention.
+    """
+    # relative vector with minimal image
+    d = minimal_image_rel(q1, q2, boxsize)                 # (..., 3)
+    r = torch.linalg.norm(d, dim=-1).clamp_min(eps)     # (...,)
+    e1 = d / r.unsqueeze(-1)                            # (..., 3)
+
+    # Choose a reference axis not too aligned with e1 to build e2 stably
+    # If |e1_x| < 0.9 => use x-axis else y-axis
+    ex = torch.zeros_like(e1)
+    ex[..., 0] = 1.0
+    ey = torch.zeros_like(e1)
+    ey[..., 1] = 1.0
+    use_ex = (e1[..., 0].abs() < 0.9).unsqueeze(-1)     # (..., 1)
+    a = torch.where(use_ex, ex, ey)                      # (..., 3)
+
+    # Gram–Schmidt to make e2 orthogonal to e1
+    a_proj = (a * e1).sum(dim=-1, keepdim=True) * e1
+    u2 = a - a_proj
+    u2_norm = torch.linalg.norm(u2, dim=-1, keepdim=True).clamp_min(eps)
+    e2 = u2 / u2_norm                                    # (..., 3)
+
+    # Right-handed e3
+    e3 = torch.cross(e1, e2, dim=-1)                     # (..., 3)
+    e3_norm = torch.linalg.norm(e3, dim=-1, keepdim=True).clamp_min(eps)
+    e3 = e3 / e3_norm
+
+    # Rotation matrix with columns [e1, e2, e3]
+    R = torch.stack([e1, e2, e3], dim=-1)                # (..., 3, 3)
+    return R, r
+
+def to_local(R: torch.Tensor, v_xyz: torch.Tensor) -> torch.Tensor:
+    """
+    Convert vectors from lab xyz to local frame.
+
+    R: (..., 3, 3) with columns [e1,e2,e3] in xyz
+    v_xyz: (..., 3)
+    returns v_local: (..., 3)
+    """
+    # v_local = R^T v_xyz
+    return (R.transpose(-2, -1) @ v_xyz.unsqueeze(-1)).squeeze(-1)
+
+
+def to_xyz(R: torch.Tensor, v_local: torch.Tensor) -> torch.Tensor:
+    """
+    Convert vectors from local frame to lab xyz.
+
+    R: (..., 3, 3)
+    v_local: (..., 3)
+    returns v_xyz: (..., 3)
+    """
+    # v_xyz = R v_local
+    return (R @ v_local.unsqueeze(-1)).squeeze(-1)
+
+def dimer_rel_com(a1: torch.Tensor, a2: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Given per-particle vectors a1,a2 (...,3), return (rel, com).
+    rel = a2 - a1
+    com = 0.5*(a1 + a2)
+    """
+    rel = a2 - a1
+    com = 0.5 * (a1 + a2)
+    return rel, com
+
+def dimer_from_rel_com(rel: torch.Tensor, com: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Inverse mapping:
+    a1 = com - 0.5*rel
+    a2 = com + 0.5*rel
+    """
+    a1 = com - 0.5 * rel
+    a2 = com + 0.5 * rel
+    return a1, a2
+
+def dimer_to_local(R: torch.Tensor, a1_xyz: torch.Tensor, a2_xyz: torch.Tensor, rel=True):
+    
+    if rel==True:
+        a1_xyz, a2_xyz = dimer_rel_com(a1_xyz, a2_xyz)
+        
+    a1_loc = to_local(R, a1_xyz)
+    a2_loc = to_local(R, a2_xyz)
+
+    return a1_loc, a2_loc
+
+def dimer_to_xyz(R: torch.Tensor, a1_loc: torch.Tensor, a2_loc: torch.Tensor, rel=True):
+
+    a1_xyz = to_xyz(R, a1_loc)
+    a2_xyz = to_xyz(R, a2_loc)
+    
+    if rel==True:
+        a1_xyz, a2_xyz = dimer_from_rel_com(a1_xyz, a2_xyz)
+        
+    return a1_xyz, a2_xyz
 
 
