@@ -11,7 +11,7 @@ class CVAESampler(models.CVAE):
     """
     CVAE wrapper for compatibility with the Langevin Integrator sampling.
     """
-    def __init__(self, zdim=3, system_type="bistable", cond_type="piri", hidden=(128,128), scalers=None):
+    def __init__(self, zdim=3, system_type="bistable", cond_type="piri", hidden=(128,128)):
         super().__init__(
             zdim=zdim,
             system_type=system_type, 
