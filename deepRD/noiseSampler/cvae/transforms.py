@@ -256,3 +256,30 @@ def to_xyz(R: torch.Tensor, v_local: torch.Tensor) -> torch.Tensor:
 
     # (..., K, 3) -> (..., 3*K)
     return v_xyz.reshape(*original_shape)
+
+def unpack_state_vector(c_n_np, cond_type, device=None):
+    if cond_type not in ("E3_base", "E3_dqipipimririm"):
+        raise ValueError(f"Unsupported E3 state vector conditioning: {cond_type}")
+
+    c_n_np = np.asarray(c_n_np, dtype=np.float32)
+    if c_n_np.ndim == 1:
+        c_n_np = c_n_np[None]
+    if c_n_np.shape[-1] < 30:
+        raise ValueError(
+            f"E3 sampling expects a physical state vector with at least 30 values, got {c_n_np.shape[-1]}"
+        )
+
+    state = torch.as_tensor(c_n_np, dtype=torch.float32, device=device)
+
+    q1 = state[:, 0:3]
+    q2 = state[:, 3:6]
+    v1 = state[:, 6:9]
+    v2 = state[:, 9:12]
+    v1p = state[:, 12:15]
+    v2p = state[:, 15:18]
+    r1 = state[:, 18:21]
+    r2 = state[:, 21:24]
+    r1p = state[:, 24:27]
+    r2p = state[:, 27:30]
+
+    return q1, q2, v1, v2, v1p, v2p, r1, r2, r1p, r2p

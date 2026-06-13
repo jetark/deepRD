@@ -105,10 +105,16 @@ def load_config(path: str | Path) -> CVAEConfig:
 
 
 def build_model_from_config(config: CVAEConfig):
-    if config.model.model_type == "cvae":
+    """Builds the CVAE model based on the provided configuration."""
+    
+    if config.model.model_type == "CVAE":
         from deepRD.noiseSampler.cvae.models import CVAE as model_class
-    elif config.model.model_type == "cvae_lf":
+    elif config.model.model_type == "CVAE_LF":
         from deepRD.noiseSampler.cvae.models import CVAE_LF as model_class
+    elif config.model.model_type == "CVAE_Inv":
+        from deepRD.noiseSampler.cvaeSampler import CVAE_Inv as model_class
+    elif config.model.model_type == "CVAE_E3":
+        from deepRD.noiseSampler.cvaeSampler import CVAESampler_E3 as model_class
     else:
         raise ValueError(f"Unknown model type: {config.model.model_type}")
 

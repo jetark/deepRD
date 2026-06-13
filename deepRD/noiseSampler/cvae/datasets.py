@@ -400,12 +400,162 @@ def construct_rc_dimer(q, v, r, cond_type):
         
         r_next = to_local(R_n, r_next)
         c = torch.cat((delta_x, delta_vx, to_local(R_n, c[..., 2:])), dim=-1)
+
+    elif cond_type == "inv_pipimririm":
+        r1_next = r1[:, 2:, :]
+        r2_next = r2[:, 2:, :]
+        r_next  = torch.cat([r1_next, r2_next], dim=-1)  # [..., 6]
+
+        q1_n    = q1[:, 1:-1, :];  q2_n    = q2[:, 1:-1, :]
+        v1_n    = v1[:, 1:-1, :];  v2_n    = v2[:, 1:-1, :]
+        r1_n    = r1[:, 1:-1, :];  r2_n    = r2[:, 1:-1, :]
+        v1_prev = v1[:, :-2,  :];  v2_prev = v2[:, :-2,  :]
+        r1_prev = r1[:, :-2,  :];  r2_prev = r2[:, :-2,  :]
+
+        # Bond axis + local frame at time n
+        R_n, _ = build_local_frame(q1_n, q2_n)
+        d  = minimal_image_rel(q1_n, q2_n, boxsize=5.0)
+        dx = torch.linalg.norm(d, dim=-1, keepdim=True)
+        e  = d / dx.clamp_min(1e-12)
+
+        def axial(x): return torch.sum(x * e, dim=-1, keepdim=True)
+        def norm_(x): return torch.linalg.norm(x, dim=-1, keepdim=True)
+
+        dvx = axial(v2_n - v1_n)
+
+        # r projected onto current local frame — preserves transverse direction
+        r1_n_loc    = to_local(R_n, r1_n)    # (..., 3)
+        r2_n_loc    = to_local(R_n, r2_n)    # (..., 3)
+        r1_prev_loc = to_local(R_n, r1_prev) # (..., 3)  current frame, not frame at n-1
+        r2_prev_loc = to_local(R_n, r2_prev) # (..., 3)
+
+        c = torch.cat([
+            dx,  dvx,                            # 2   bond geometry     (invariant)
+            norm_(v1_n),   axial(v1_n),          # 2   bead-1 vel at n   (invariant)
+            norm_(v2_n),   axial(v2_n),          # 2   bead-2 vel at n   (invariant)
+            norm_(v1_prev), axial(v1_prev),      # 2   bead-1 vel at n-1 (invariant)
+            norm_(v2_prev), axial(v2_prev),      # 2   bead-2 vel at n-1 (invariant)
+            r1_n_loc,   r2_n_loc,               # 6   r at n    (local frame)
+            r1_prev_loc, r2_prev_loc,           # 6   r at n-1  (local frame)
+        ], dim=-1)                               # total: 22 dims
+
+        # Output also in current local frame
+        r_next = to_local(R_n, r_next)
+
+    elif cond_type == "E3_base":
+
+        r1_next = r1[:, 2:, :]
+        r2_next = r2[:, 2:, :]
+
+        q1_n    = q1[:, 1:-1, :];  q2_n    = q2[:, 1:-1, :]
+        v1_n    = v1[:, 1:-1, :];  v2_n    = v2[:, 1:-1, :]
+        r1_n    = r1[:, 1:-1, :];  r2_n    = r2[:, 1:-1, :]
+        v1_prev = v1[:, :-2,  :];  v2_prev = v2[:, :-2,  :]
+        r1_prev = r1[:, :-2,  :];  r2_prev = r2[:, :-2,  :]
+
+        # Bond axis
+        d  = minimal_image_rel(q1_n, q2_n, boxsize=5.0)
+        dx = torch.linalg.norm(d, dim=-1, keepdim=True)
+        e  = d / dx.clamp_min(1e-12)
+
+        input_vectors = torch.stack([e, v1_n, v2_n, r1_n, r2_n, v1_prev, v2_prev, r1_prev, r2_prev], dim=-2)
+        row_norms = torch.linalg.norm(input_vectors, dim=-1, keepdim=True).clamp_min(1e-12)
+        input_vectors = input_vectors / row_norms
+
+        # Encoder: r^{n+1}_xyz → invariant representation (projections onto unit basis vectors)
+        r1_coords = (input_vectors @ r1_next.unsqueeze(-1)).squeeze(-1)  # (..., N_vec)
+        r2_coords = (input_vectors @ r2_next.unsqueeze(-1)).squeeze(-1)  # (..., N_vec)
+        r_next = torch.cat([r1_coords, r2_coords], dim=-1)  # (..., 2*N_vec) — fully invariant
+        
+        def axial(x): return torch.sum(x * e, dim=-1, keepdim=True)
+        def norm_(x): return torch.linalg.norm(x, dim=-1, keepdim=True)
+
+        dvx = axial(v2_n - v1_n)
+
+        c = torch.cat([
+            dx,   dvx,
+            norm_(v1_n),  axial(v1_n),
+            norm_(v2_n),  axial(v2_n),
+            norm_(v1_prev), axial(v1_prev),
+            norm_(v2_prev), axial(v2_prev),
+            norm_(r1_n),  axial(r1_n),
+            norm_(r2_n),  axial(r2_n),
+            norm_(r1_prev), axial(r1_prev),
+            norm_(r2_prev), axial(r2_prev),
+        ], dim=-1)   # (B, 18)
+
     else:
         raise ValueError(
             f"Unknown conditioning type: {cond_type} for 'dimer'. "
         )
 
     return r_next, c
+
+
+def build_e3_eval_dataset(q, v, r, n_datasets=None, val_fraction=0.2):
+    """
+    Build physical (r_next_xyz, state_vector) pairs for CVAE_E3 evaluation.
+
+    The time alignment mirrors the 'E3_base' branch of construct_rc_dimer:
+      state at n  : q1[n], q2[n], v1[n], v2[n], v1[n-1], v2[n-1],
+                    r1[n], r2[n], r1[n-1], r2[n-1]      → 30D
+      target r_{n+1}: r1[n+1], r2[n+1]                 → 6D
+
+    The train/val split is identical to make_train_val_ds (first 80% of
+    trajectories for training, last 20% for validation).
+
+    Parameters
+    ----------
+    q, v, r       : array-like, shape (n_trajs, T, 3)
+                    Raw interleaved arrays from extract_vars() — even rows are bead 1,
+                    odd rows are bead 2, matching the convention of split_particles().
+    n_datasets    : int or None
+                    Number of leading trajectories to use (None = all).
+    val_fraction  : float
+
+    Returns
+    -------
+    r_phys_train  : np.ndarray, (N_train, 6)  — physical r_next, lab frame
+    c_state_train : np.ndarray, (N_train, 30) — raw state vectors
+    r_phys_val    : np.ndarray, (N_val,   6)
+    c_state_val   : np.ndarray, (N_val,   30)
+    """
+    q = np.asarray(q, dtype=np.float32)
+    v = np.asarray(v, dtype=np.float32)
+    r = np.asarray(r, dtype=np.float32)
+
+    if n_datasets is not None:
+        q = q[:n_datasets]; v = v[:n_datasets]; r = r[:n_datasets]
+
+    # Split interleaved bead rows (same convention as construct_rc_dimer / split_particles):
+    # even timestep indices → bead 1, odd → bead 2.
+    q1 = q[:, 0::2, :];  q2 = q[:, 1::2, :]
+    v1 = v[:, 0::2, :];  v2 = v[:, 1::2, :]
+    r1 = r[:, 0::2, :];  r2 = r[:, 1::2, :]
+
+    # same time slicing as construct_rc_dimer 'E3_base'
+    q1_n    = q1[:, 1:-1]; q2_n    = q2[:, 1:-1]
+    v1_n    = v1[:, 1:-1]; v2_n    = v2[:, 1:-1]
+    v1_prev = v1[:, :-2 ]; v2_prev = v2[:, :-2 ]
+    r1_n    = r1[:, 1:-1]; r2_n    = r2[:, 1:-1]
+    r1_prev = r1[:, :-2 ]; r2_prev = r2[:, :-2 ]
+    r1_next = r1[:, 2:  ]; r2_next = r2[:, 2:  ]
+
+    c_state = np.concatenate(
+        [q1_n, q2_n, v1_n, v2_n, v1_prev, v2_prev,
+         r1_n, r2_n, r1_prev, r2_prev], axis=-1
+    )                                                  # (n_trajs, T-2, 30)
+    r_next_phys = np.concatenate([r1_next, r2_next], axis=-1)  # (n_trajs, T-2, 6)
+
+    split = int((1.0 - val_fraction) * c_state.shape[0])
+
+    r_phys_train  = r_next_phys[:split].reshape(-1, 6)
+    c_state_train = c_state[:split].reshape(-1, 30)
+    r_phys_val    = r_next_phys[split:].reshape(-1, 6)
+    c_state_val   = c_state[split:].reshape(-1, 30)
+
+    return r_phys_train, c_state_train, r_phys_val, c_state_val
+
 
 def construct_rc_bistable(q_eff, v_eff, r_eff, cond_type):
     # ---- build one-step pairs on the effective grid ----
@@ -492,7 +642,9 @@ def make_train_val_ds(r_next_norm, c_norm, weights, n_timesteps, n_datasets, L, 
         # effective number of r_{n+1} steps per trajectory (before stride)
         if conditionedOn in ('piri'):
             T_eff = T_full - 1    # r_{n+1} exists for n = 0..T_full-2
-        elif conditionedOn in ("local_pipimririm", "local_dqipipimririm", "local_dqidpipipimririm"):
+        elif conditionedOn in ("pipimdqidpiririm",
+                                "local_pipimririm", "local_dqipipimririm", "local_dqidpipipimririm", 
+                                "inv_pipimririm", "E3_base"):
             T_eff = T_full - 2         # you lose an extra step for r_{n-1}
         else:
             raise ValueError(f"Unknown conditioning: {conditionedOn}")

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torchvision
-from deepRD.tools.modelsTools import MLP, DiagGaussianHead, reparam
+from deepRD.tools.modelsTools import MLP, DiagGaussianHead, reparam, FullGaussianHead
 
 # ---------- CVAE ----------
 class CVAE(nn.Module):
@@ -9,15 +9,21 @@ class CVAE(nn.Module):
     Basic CVAE class. 
     Learned prior p(z|c) and Gaussian encoder/decoder with diagonal covariances.
     """
-    def __init__(self, zdim=3, system_type="bistable", cond_type="piri", hidden=(128,128)):
+    def __init__(self, zdim=3, system_type="bistable", cond_type="piri", hidden=(128,128), dim_maps=None):
         super().__init__()
         
         assert system_type in ("bistable", "dimer")
         self.system_type = system_type
         self.cond_type = cond_type
         self.zdim = zdim
-        
-        self.idim, self.cdim = self.assign_dims(system_type=system_type, cond_type=cond_type)
+                
+        if dim_maps is None:
+            idim_map, cdim_map = None, None
+        else:
+            idim_map, cdim_map = dim_maps
+            
+        self.idim, self.cdim = self.assign_dims(system_type=system_type, cond_type=cond_type,
+                                                idim_map=idim_map, cdim_map=cdim_map)
         
         # networks
         self.encoder = MLP(self.idim + self.cdim, out_dim=2*zdim, hidden=hidden)
@@ -29,9 +35,10 @@ class CVAE(nn.Module):
         self.scaler_c = None
 
     @staticmethod
-    def assign_dims(system_type: str, cond_type: str, cdim_map=None) -> tuple[int, int]:
+    def assign_dims(system_type: str, cond_type: str, idim_map=None, cdim_map=None) -> tuple[int, int]:
         # idim by system
-        idim_map = {"bistable": 3, "dimer": 6}
+        if idim_map ==None:
+            idim_map = {"bistable": 3, "dimer": 6}
         assert system_type in idim_map, f"Unknown system_type={system_type!r}"
         idim = idim_map[system_type]
 
@@ -130,6 +137,67 @@ class CVAE(nn.Module):
             return r, (mu, log_sigma)
         else:
             return r
+
+# ---------- CVAE ----------
+class CVAE_E3(CVAE):
+    """
+    SO(3) equivariant version of the CVAE. 
+    Standard prior N(0, I) and Gaussian encoder/decoder with diagonal covariances.
+    """
+    def __init__(self, zdim=3, system_type="dimer", cond_type="E3_base", hidden=(256,256)):
+
+        idim_map = {"dimer": 18}
+        cdim_map = {
+                "dimer": {
+                    "E3_base": 18
+                },
+            }
+        dim_maps = (idim_map, cdim_map)
+        super().__init__(zdim, system_type, cond_type, hidden, dim_maps)
+
+        self.N_vec = self.idim//2
+    
+    def prior_params(self, c=None, batch_shape=None, device=None, dtype=None):
+        """
+        Standard Gaussian prior:
+
+            p(z) = N(0, I)
+
+        Returns p_mu = 0, p_logvar = 0.
+
+        c is accepted only for API compatibility with the learned-prior version.
+        """
+        if c is not None:
+            shape = (*c.shape[:-1], self.zdim)
+            device = c.device
+            dtype = c.dtype
+        else:
+            assert batch_shape is not None, "Need either c or batch_shape."
+            shape = (*batch_shape, self.zdim)
+
+        p_mu = torch.zeros(shape, device=device, dtype=dtype)
+        p_logvar = torch.zeros(shape, device=device, dtype=dtype)
+
+        return p_mu, p_logvar
+    
+    # ----- sampling ----- #
+    @torch.no_grad()
+    def sample_torch(self, c, Tr=1.0, Tz=1.0):
+        """
+        Samples the decoder output from torch tensor, no (de)normalisation.
+        """
+        # samples z from p(z) ~ N(0,1)
+        z = torch.randn(
+            *c.shape[:-1],
+            self.zdim,
+            device=c.device,
+            dtype=c.dtype,
+        ) * Tz
+        
+        mu, log_sigma = self.decode(z, c)
+        r = mu + torch.exp(log_sigma) * torch.randn_like(mu) * Tr
+        return r
+    
 
 # ---------- CVAE ----------
 class CVAE_LF(nn.Module):

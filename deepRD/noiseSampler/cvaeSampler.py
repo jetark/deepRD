@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from deepRD.tools.trajectoryTools import minimal_image_rel, build_local_frame, to_local, to_xyz, dimer_rel_com, dimer_from_rel_com
 import deepRD.noiseSampler.cvae.models as models
+import deepRD.noiseSampler.cvae.transforms as transforms
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ---------- CVAE ----------
@@ -11,12 +12,13 @@ class CVAESampler(models.CVAE):
     """
     CVAE wrapper for compatibility with the Langevin Integrator sampling.
     """
-    def __init__(self, zdim=3, system_type="bistable", cond_type="piri", hidden=(128,128)):
+    def __init__(self, zdim=3, system_type="bistable", cond_type="piri", hidden=(128,128), dim_maps=None):
         super().__init__(
             zdim=zdim,
             system_type=system_type, 
             cond_type=cond_type, 
-            hidden=hidden)
+            hidden=hidden,
+            dim_maps=dim_maps)
 
     @torch.no_grad()
     def sample(self, c_n_np, Tr=1.0, Tz=1.0, device=None, return_stats=False):
@@ -54,13 +56,6 @@ class CVAESampler(models.CVAE):
         if c_n_np.ndim == 1:
             c_n_np = c_n_np.reshape(1, -1)
             single_sample = True
-
-        if self.cond_type=='e1pipimdqiririm':
-            q1, q2 = torch.from_numpy(c_n_np[:, :3]), torch.from_numpy(c_n_np[:, 3:6])
-            dRi = minimal_image_rel(q1, q2, boxsize=5.0, boundary_type='periodic')
-            dx = torch.norm(dRi, dim=-1)
-            e1 = dRi/dx
-            c_n_np = np.concatenate((np.array(e1), c_n_np[:, 6:]), axis=-1)
         
         c_norm = self.scaler_c.transform(c_n_np).astype(np.float32)
 
@@ -73,14 +68,169 @@ class CVAESampler(models.CVAE):
         r_next_np = r_next_norm_t.cpu().numpy()
         r_next_phys = self.scaler_r.inverse_transform(r_next_np)
 
-        if self.cond_type=="relcom_pipimririm":       
-            rel, com = dimer_from_rel_com(r_next_phys[:, :3], r_next_phys[:, 3:])
-            r_next_phys = np.concatenate((rel, com), axis=-1)
-
         if single_sample:
             r_next_phys = r_next_phys.squeeze()  # (3,)
 
         return r_next_phys
+
+class CVAESampler_E3(models.CVAE_E3):
+    def __init__(self, zdim=3, system_type="dimer", cond_type="E3_base", hidden=(256,256)):
+        super().__init__(
+            zdim=zdim,
+            system_type=system_type, 
+            cond_type=cond_type, 
+            hidden=hidden)
+
+    def _e3_conditioning_and_basis(self, c_n_np, device):
+        c_n_np = np.asarray(c_n_np, dtype=np.float32)
+        if c_n_np.ndim == 1:
+            c_n_np = c_n_np[None]
+
+        q1, q2, v1, v2, v1p, v2p, r1, r2, r1p, r2p = transforms.unpack_state_vector(
+            c_n_np, self.cond_type, device=device
+        )
+
+        # --- Bond axis ---
+        _, bond_len = build_local_frame(q1, q2, boxsize=5.0)
+        d = minimal_image_rel(q1, q2, boxsize=5.0)
+        dx = bond_len.unsqueeze(-1)        # (B,1)
+        e  = d / dx.clamp_min(1e-12)      # (B,3) unit bond vector
+
+        input_vectors = torch.stack([e, v1, v2, r1, r2, v1p, v2p, r1p, r2p], dim=-2) # (B, N_vec, 3)
+        # Normalize rows so all basis vectors are unit-length.
+        # This makes projection coefficients p_i = v̂_i · r all live on the same scale
+        # and keeps V^T V well-conditioned regardless of physical magnitude differences
+        # between bond axis (unit), velocities (~0.2), and noise vectors (~0.016).
+        # The reconstruction r = (V^T V)^{-1} V^T p is identical before and after normalization.
+        row_norms = torch.linalg.norm(input_vectors, dim=-1, keepdim=True).clamp_min(1e-12)
+        input_vectors = input_vectors / row_norms
+
+        def axial(x): return torch.sum(x * e, dim=-1, keepdim=True)
+        def norm_(x): return torch.linalg.norm(x, dim=-1, keepdim=True)
+
+        dvx = axial(v2 - v1)
+
+        # building conditioning out of scalars only
+        c_scalar_t = torch.cat([
+            dx,   dvx,
+            norm_(v1),  axial(v1),
+            norm_(v2),  axial(v2),
+            norm_(v1p), axial(v1p),
+            norm_(v2p), axial(v2p),
+            norm_(r1),  axial(r1),
+            norm_(r2),  axial(r2),
+            norm_(r1p), axial(r1p),
+            norm_(r2p), axial(r2p),
+        ], dim=-1)   # (B, 18)
+
+        return c_scalar_t, input_vectors
+
+    def _projected_vectors_to_xyz(self, p_phys, input_vectors):
+        """Reparametrize projection coefficients into output"""
+        p1_phys = p_phys[:, :self.N_vec]
+        p2_phys = p_phys[:, self.N_vec:]
+
+        # Reconstruct r via least squares: input_vectors @ r = p
+        WtW = torch.bmm(input_vectors.transpose(-2, -1), input_vectors)  # (B, 3, 3)
+        r1_next = torch.linalg.solve(
+            WtW,
+            torch.bmm(input_vectors.transpose(-2, -1), p1_phys.unsqueeze(-1))
+        ).squeeze(-1)
+        r2_next = torch.linalg.solve(
+            WtW,
+            torch.bmm(input_vectors.transpose(-2, -1), p2_phys.unsqueeze(-1))
+        ).squeeze(-1)
+
+        return torch.cat((r1_next, r2_next), dim=-1)
+
+    def physical_to_model_space(self, r_next_np, c_n_np, device=None):
+        """
+        Converts physical vectors to the equivariant representation.
+        Outputs stay unnormalized.
+        """
+        if device is None:
+            device = next(self.parameters()).device
+
+        r_next_np = np.asarray(r_next_np, dtype=np.float32)
+        single = r_next_np.ndim == 1
+        if single:
+            r_next_np = r_next_np[None]
+        if r_next_np.shape[-1] != 6:
+            raise ValueError(f"E3 physical targets must have shape (..., 6), got {r_next_np.shape}")
+
+        c_scalar_t, input_vectors = self._e3_conditioning_and_basis(c_n_np, device)
+        r_next_t = torch.as_tensor(r_next_np, dtype=torch.float32, device=device)
+        r1_next = r_next_t[:, :3]
+        r2_next = r_next_t[:, 3:6]
+
+        p1 = torch.bmm(input_vectors, r1_next.unsqueeze(-1)).squeeze(-1)
+        p2 = torch.bmm(input_vectors, r2_next.unsqueeze(-1)).squeeze(-1)
+        r_model_t = torch.cat([p1, p2], dim=-1)
+
+        r_model = r_model_t.detach().cpu().numpy()
+        c_model = c_scalar_t.detach().cpu().numpy()
+        if single:
+            return r_model.squeeze(0), c_model.squeeze(0)
+        return r_model, c_model
+
+    def projected_output_to_physical(self, output_norm, c_n_np, device=None):
+        if self.scaler_r is None:
+            raise ValueError("Call attach_normalizers() before converting E3 outputs.")
+        if device is None:
+            device = next(self.parameters()).device
+
+        if torch.is_tensor(output_norm):
+            output_norm_np = output_norm.detach().cpu().numpy()
+        else:
+            output_norm_np = np.asarray(output_norm, dtype=np.float32)
+
+        single = output_norm_np.ndim == 1
+        if single:
+            output_norm_np = output_norm_np[None]
+
+        _, input_vectors = self._e3_conditioning_and_basis(c_n_np, device)
+        p_phys = torch.as_tensor(
+            self.scaler_r.inverse_transform(output_norm_np).astype(np.float32),
+            dtype=torch.float32,
+            device=device,
+        )
+        r_next = self._projected_vectors_to_xyz(p_phys, input_vectors)
+        r_next_np = r_next.detach().cpu().numpy()
+
+        return r_next_np.squeeze(0) if single else r_next_np
+
+    @torch.no_grad()
+    def sample(self, c_n_np, Tr=1.0, Tz=1.0, device=None):
+        if self.scaler_c is None or self.scaler_r is None:
+            raise ValueError("Call attach_normalizers() before sample().")
+        if device is None:
+            device = next(self.parameters()).device
+        if hasattr(self, "Tr"): Tr = self.Tr
+        if hasattr(self, "Tz"): Tz = self.Tz
+
+        c_n_np = np.asarray(c_n_np, dtype=np.float32)
+        single = c_n_np.ndim == 1
+        if single:
+            c_n_np = c_n_np[None]  # (1, 30)
+
+        c_scalar_t, input_vectors = self._e3_conditioning_and_basis(c_n_np, device)
+
+        # --- Normalize, sample in local frame, denormalize ---
+        c_np = c_scalar_t.cpu().numpy().astype(np.float32)
+        c_norm = self.scaler_c.transform(c_np).astype(np.float32)
+        c_norm_t = torch.from_numpy(c_norm).to(device)
+
+        alpha = self.sample_torch(c_norm_t, Tr=Tr, Tz=Tz) # (1, idim)
+        # Equivariant reconstruction
+        p_phys = torch.from_numpy(
+        self.scaler_r.inverse_transform(alpha.cpu().numpy()).astype(np.float32)
+        ).to(device)  # (B, 18)
+
+        r_next = self._projected_vectors_to_xyz(p_phys, input_vectors)
+        r_next_np = r_next.detach().cpu().numpy()
+
+        return r_next_np.squeeze(0) if single else r_next_np
+    
 
 # ---------- CVAE ----------
 class CVAE_SP(CVAESampler):
@@ -287,3 +437,101 @@ class CVAE_LF(CVAESampler):
 
         return out_xyz.squeeze(0) if single_sample else out_xyz
 
+class CVAE_Inv(CVAESampler):
+    """
+    CVAE sampler with invariant scalar conditioning and local-frame output.
+    Supports cond_type='inv_pipimririm'.
+    
+    The integrator passes a raw state vector of shape (30,):
+        [q1(3), q2(3), v1(3), v2(3), v1_prev(3), v2_prev(3),
+         r1(3), r2(3), r1_prev(3), r2_prev(3)]
+    This class extracts invariant scalars from the state, runs the CVAE,
+    and rotates the local-frame output back to xyz.
+    """
+
+    @staticmethod
+    def assign_dims(system_type, cond_type):
+        idim_map = {"dimer": 6}
+        cdim_map = {"dimer": {"inv_pipimririm": 22}}
+        assert system_type in idim_map
+        assert cond_type in cdim_map[system_type]
+        return idim_map[system_type], cdim_map[system_type][cond_type]
+
+    def prior_params(self, c=None, batch_shape=None, device=None, dtype=None):
+        if c is not None:
+            shape = (*c.shape[:-1], self.zdim); device = c.device; dtype = c.dtype
+        else:
+            shape = (*batch_shape, self.zdim)
+        return torch.zeros(shape, device=device, dtype=dtype), \
+               torch.zeros(shape, device=device, dtype=dtype)
+
+    @torch.no_grad()
+    def sample_torch(self, c, Tr=1.0, Tz=1.0, return_stats=False):
+        z = torch.randn(*c.shape[:-1], self.zdim, device=c.device, dtype=c.dtype) * Tz
+        mu, log_sigma = self.decode(z, c)
+        r = mu + torch.exp(log_sigma) * torch.randn_like(mu) * Tr
+        return (r, (mu, log_sigma)) if return_stats else r
+
+    @torch.no_grad()
+    def sample(self, c_n_np, Tr=1.0, Tz=1.0, device=None):
+        if self.scaler_c is None or self.scaler_r is None:
+            raise ValueError("Call attach_normalizers() before sample().")
+        if device is None:
+            device = next(self.parameters()).device
+        if hasattr(self, "Tr"): Tr = self.Tr
+        if hasattr(self, "Tz"): Tz = self.Tz
+
+        c_n_np = np.asarray(c_n_np, dtype=np.float32)
+        single = c_n_np.ndim == 1
+        if single:
+            c_n_np = c_n_np[None]  # (1, 30)
+
+        # --- Unpack state vector ---
+        q1 = torch.from_numpy(c_n_np[:, 0:3]).to(device)
+        q2 = torch.from_numpy(c_n_np[:, 3:6]).to(device)
+
+        v1 = torch.from_numpy(c_n_np[:, 6:9]).to(device)
+        v2 = torch.from_numpy(c_n_np[:, 9:12]).to(device)
+        v1p= torch.from_numpy(c_n_np[:, 12:15]).to(device)
+        v2p= torch.from_numpy(c_n_np[:, 15:18]).to(device)
+        r1 = torch.from_numpy(c_n_np[:, 18:21]).to(device)
+        r2 = torch.from_numpy(c_n_np[:, 21:24]).to(device)
+        r1p= torch.from_numpy(c_n_np[:, 24:27]).to(device)
+        r2p= torch.from_numpy(c_n_np[:, 27:30]).to(device)
+
+        # --- Bond axis ---
+        R, bond_len = build_local_frame(q1, q2, boxsize=5.0)
+        d = minimal_image_rel(q1, q2, boxsize=5.0)
+        dx = bond_len.unsqueeze(-1)        # (B,1)
+        e  = d / dx.clamp_min(1e-12)      # (B,3) unit bond vector
+
+        def axial(x): return torch.sum(x * e, dim=-1, keepdim=True)
+        def norm_(x): return torch.linalg.norm(x, dim=-1, keepdim=True)
+
+        dvx = axial(v2 - v1)
+
+        c_t = torch.cat([
+            dx,   dvx,
+            norm_(v1),  axial(v1),
+            norm_(v2),  axial(v2),
+            norm_(v1p), axial(v1p),
+            norm_(v2p), axial(v2p),
+            norm_(r1),  axial(r1),
+            norm_(r2),  axial(r2),
+            norm_(r1p), axial(r1p),
+            norm_(r2p), axial(r2p),
+        ], dim=-1)   # (B, 18)
+
+        # --- Normalize, sample in local frame, denormalize ---
+        c_np = c_t.cpu().numpy().astype(np.float32)
+        c_norm = self.scaler_c.transform(c_np).astype(np.float32)
+        c_norm_t = torch.from_numpy(c_norm).to(device)
+
+        r_loc_norm = self.sample_torch(c_norm_t, Tr=Tr, Tz=Tz)
+        r_loc = self.scaler_r.inverse_transform(r_loc_norm.cpu().numpy())
+
+        # --- Rotate local-frame output back to xyz ---
+        r_loc_t = torch.from_numpy(r_loc.astype(np.float32)).to(device)
+        r_xyz = to_xyz(R, r_loc_t).cpu().numpy()
+
+        return r_xyz.squeeze(0) if single else r_xyz

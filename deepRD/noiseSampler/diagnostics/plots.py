@@ -9,6 +9,19 @@ General plotting utilities for CVAE training/evaluation visualization
 """
 
 
+def _is_e3_model(model):
+    return getattr(model, "cond_type", None) == "E3_base" or (
+        hasattr(model, "physical_to_model_space")
+        and hasattr(model, "projected_output_to_physical")
+    )
+
+
+def _as_numpy(x):
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
 # ====================================
 # === TRAINING EVAL PLOTS ===
 # ====================================
@@ -58,6 +71,16 @@ def visualize_latent_distributions(model, r_next, c_n, n_samples=50000, device='
     c_s = c_n[idx]
     r_next_s = r_next[idx]
 
+    if _is_e3_model(model):
+        if r_next_s.shape[-1] == 6:
+            r_next_s, c_s = model.physical_to_model_space(r_next_s, c_s, device=device)
+        elif r_next_s.shape[-1] != model.idim or c_s.shape[-1] != model.cdim:
+            raise ValueError(
+                "CVAE_E3 latent diagnostics need either physical inputs "
+                "(r_next shape [N, 6], c_n state shape [N, 30]) or model-space "
+                f"inputs (r_next shape [N, {model.idim}], c_n shape [N, {model.cdim}])."
+            )
+
     # Normalize
     c_norm = torch.tensor(model.scaler_c.transform(c_s), dtype=torch.float32, device=device)
     r_next_norm = torch.tensor(model.scaler_r.transform(r_next_s), dtype=torch.float32, device=device)
@@ -98,6 +121,9 @@ def visualize_latent_distributions(model, r_next, c_n, n_samples=50000, device='
     plt.tight_layout()
     plt.show()
 
+def visualize_latent_space(*args, **kwargs):
+    return visualize_latent_distributions(*args, **kwargs)
+
 def plot_r_distributions(model, r_next, c_n,
                          n_samples=50000, device='cpu',
                          Tr=1.0, Tz=1.0):
@@ -121,18 +147,24 @@ def plot_r_distributions(model, r_next, c_n,
     idx = np.random.choice(N, size=min(n_samples, N), replace=False)
     c_s = c_n[idx]
     r_next_s = r_next[idx]
-
-    # dimensionality check
-    D = r_next_s.shape[1]
-    if D not in (3, 6):
-        raise ValueError(f"Expected r_next to have dim 3 or 6, got {D}.")
+    e3_model = _is_e3_model(model)
 
     # number of particles (1 or 2), each with 3 dims
-    n_particles = D // 3
+    n_particles = 2 if model.system_type == 'dimer' else 1
+
+    if e3_model:
+        if r_next_s.shape[-1] != 6:
+            raise ValueError(
+                "plot_r_distributions expects physical 6D r_next for CVAE_E3 so it can "
+                "compare physical xyz distributions."
+            )
+        r_model_s, c_model_s = model.physical_to_model_space(r_next_s, c_s, device=device)
+    else:
+        r_model_s, c_model_s = r_next_s, c_s
 
     # --- Normalise ---
-    c_norm = torch.tensor(model.scaler_c.transform(c_s), dtype=torch.float32)
-    r_next_norm = torch.tensor(model.scaler_r.transform(r_next_s), dtype=torch.float32)
+    c_norm = torch.tensor(model.scaler_c.transform(c_model_s), dtype=torch.float32)
+    r_next_norm = torch.tensor(model.scaler_r.transform(r_model_s), dtype=torch.float32)
 
     # --- Forward pass (reconstruction) ---
     model.eval()
@@ -145,11 +177,14 @@ def plot_r_distributions(model, r_next, c_n,
         r_rec_norm_t = mu_r + torch.exp(log_sig_r) * torch.randn_like(mu_r) * Tr
         
         # denormalizing to physical units
-        r_rec = model.scaler_r.inverse_transform(r_rec_norm_t.cpu().numpy())
+        if e3_model:
+            r_rec = model.projected_output_to_physical(r_rec_norm_t, c_s, device=device)
+        else:
+            r_rec = model.scaler_r.inverse_transform(r_rec_norm_t.cpu().numpy())
 
         # --- Generated samples (already returns physical units) ---
-        r_gen_norm_t = model.sample_torch(c_t, Tr=Tr, Tz=Tz)  # shape [N, D]
-        r_gen = model.scaler_r.inverse_transform(r_gen_norm_t.cpu().numpy())
+        r_gen = _as_numpy(model.sample(c_s, Tr=Tr, Tz=Tz, device=device))  # shape [N, D]
+
 
     # --- Plot ---
     # rows = n_particles (1 or 2), cols = 3 (x,y,z)
