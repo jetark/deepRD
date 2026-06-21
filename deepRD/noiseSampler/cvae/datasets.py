@@ -47,6 +47,10 @@ def load_datasets(datasetDirectory, n_datasets, n_total, trajtype='bench'):
     - dataset (torch.Tensor): Combined dataset tensor.
     - parameters (dict): Loaded parameters from the parameters file.
     """
+    if (datasetDirectory==None)&(trajtype=='bench'):
+        datasetDirectory = "/group/ag_cmb/scratch/maojrs/" \
+        "stochasticClosure/boxsize5/benchmark/"
+        n_total = 2500
 
     fileName = "simMoriZwanzigReduced_" if type=='reduced' else "simMoriZwanzig_"
     
@@ -82,7 +86,22 @@ def extract_vars(dataset):
 
     return q, v, r
 
-def normalize_RC(r, c, scaler_r, scaler_c):
+def extract_vars_cat(dataset):
+    """
+    Extract q, v, r from the dataset tensor.
+    Return concatenated along the last dim.
+    Assume dimer data.
+    """
+    assert dataset.shape[1]%2==0
+    q_st, v_st, r_st = extract_vars(dataset)
+    
+    q = torch.cat((q_st[:, ::2], q_st[:, 1::2]), dim=-1)
+    v = torch.cat((v_st[:, ::2], v_st[:, 1::2]), dim=-1)
+    r = torch.cat((r_st[:, ::2], r_st[:, 1::2]), dim=-1)
+
+    return q, v, r
+
+def normalize_RC(r_next, c, scaler_r, scaler_c):
     """
     Normalize r and c using provided pre-fit scalers.
     """

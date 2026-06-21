@@ -17,7 +17,7 @@ def load_run(run_dir, map_location="cpu"):
     model = build_model_from_config(config)
     checkpoint = torch.load(run_dir / config.paths.checkpoint_name, map_location=map_location)
     state_dict = checkpoint["model_state"] if isinstance(checkpoint, dict) and "model_state" in checkpoint else checkpoint
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)
     model.attach_normalizers(**scalers)
     model.eval()
 

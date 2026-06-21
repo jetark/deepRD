@@ -2,13 +2,16 @@ import torch
 import torch.nn as nn
 from .encoder import E3InvariantEncoder
 from .decoder import E3EquivariantDecoder
+from .axial_covariance import bond_unit_from_edge_vec, sample_axial_gaussian
+from .tools import append_z_to_decoder_features
 
 class E3DimerCVAE(nn.Module):
-    def __init__(self, zdim):
+    def __init__(self, zdim, hidden_irreps="32x0e + 16x1o + 8x2e"):
         super().__init__()
         self.zdim = zdim
-        self.encoder = E3InvariantEncoder(zdim=zdim)
-        self.decoder = E3EquivariantDecoder(zdim=zdim)
+        self.hidden_irreps = hidden_irreps
+        self.encoder = E3InvariantEncoder(zdim=zdim, hidden_irreps=hidden_irreps)
+        self.decoder = E3EquivariantDecoder(zdim=zdim, hidden_irreps=hidden_irreps)
 
     def reparameterize(self, z_mu, z_logvar):
         std = torch.exp(0.5 * z_logvar)
@@ -54,14 +57,21 @@ class E3DimerCVAE(nn.Module):
         return {
             "mu": mu,
             "log_sigma": log_sigma,
+            "log_sigma_para": log_sigma[:, 0:1],
+            "log_sigma_perp": log_sigma[:, 1:2],
             "z_mu": z_mu,
             "z_logvar": z_logvar,
         }
 
     @torch.no_grad()
-    def sample_torch(self, batch):
+    def sample_torch(self, batch, Tr=1.0, Tz=1.0):
         B = batch["num_graphs"]
-        z = torch.randn(B, self.zdim, device=batch["edge_vec"].device)
+        z = torch.randn(
+            B,
+            self.zdim,
+            device=batch["edge_vec"].device,
+            dtype=batch["edge_vec"].dtype,
+        ) * Tz
         z_node = z.repeat_interleave(2, dim=0)
 
         h_dec = append_z_to_decoder_features(
@@ -76,7 +86,15 @@ class E3DimerCVAE(nn.Module):
             edge_radial=batch["edge_radial"],
         )
 
-        eps = torch.randn_like(mu)
-        r_next = mu + torch.exp(log_sigma) * eps
+        bond_unit = batch.get("bond_unit_node")
+        if bond_unit is None:
+            bond_unit = bond_unit_from_edge_vec(batch["edge_vec"], B)
+        r_next = sample_axial_gaussian(
+            mu,
+            bond_unit,
+            log_sigma[:, 0:1],
+            log_sigma[:, 1:2],
+            noise_scale=Tr,
+        )
 
         return r_next, mu, log_sigma

@@ -44,7 +44,7 @@ def minimal_image_rel(q1, q2, boxsize=None, boundary_type='periodic'):
     # ORIGINAL
     rel = q2 - q1  # [..., 3]
     
-    # ZAMIENIONE!!!! 
+    # SWAPPED!!!! 
     #rel = q1 - q2  # [..., 3]
 
     if boundary_type == "periodic" and boxsize is not None:

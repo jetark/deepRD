@@ -139,67 +139,6 @@ class CVAE(nn.Module):
             return r
 
 # ---------- CVAE ----------
-class CVAE_E3(CVAE):
-    """
-    SO(3) equivariant version of the CVAE. 
-    Standard prior N(0, I) and Gaussian encoder/decoder with diagonal covariances.
-    """
-    def __init__(self, zdim=3, system_type="dimer", cond_type="E3_base", hidden=(256,256)):
-
-        idim_map = {"dimer": 18}
-        cdim_map = {
-                "dimer": {
-                    "E3_base": 18
-                },
-            }
-        dim_maps = (idim_map, cdim_map)
-        super().__init__(zdim, system_type, cond_type, hidden, dim_maps)
-
-        self.N_vec = self.idim//2
-    
-    def prior_params(self, c=None, batch_shape=None, device=None, dtype=None):
-        """
-        Standard Gaussian prior:
-
-            p(z) = N(0, I)
-
-        Returns p_mu = 0, p_logvar = 0.
-
-        c is accepted only for API compatibility with the learned-prior version.
-        """
-        if c is not None:
-            shape = (*c.shape[:-1], self.zdim)
-            device = c.device
-            dtype = c.dtype
-        else:
-            assert batch_shape is not None, "Need either c or batch_shape."
-            shape = (*batch_shape, self.zdim)
-
-        p_mu = torch.zeros(shape, device=device, dtype=dtype)
-        p_logvar = torch.zeros(shape, device=device, dtype=dtype)
-
-        return p_mu, p_logvar
-    
-    # ----- sampling ----- #
-    @torch.no_grad()
-    def sample_torch(self, c, Tr=1.0, Tz=1.0):
-        """
-        Samples the decoder output from torch tensor, no (de)normalisation.
-        """
-        # samples z from p(z) ~ N(0,1)
-        z = torch.randn(
-            *c.shape[:-1],
-            self.zdim,
-            device=c.device,
-            dtype=c.dtype,
-        ) * Tz
-        
-        mu, log_sigma = self.decode(z, c)
-        r = mu + torch.exp(log_sigma) * torch.randn_like(mu) * Tr
-        return r
-    
-
-# ---------- CVAE ----------
 class CVAE_LF(nn.Module):
     """
     CVAE with N(0,1) prior and Local Frame transformation.
@@ -324,6 +263,69 @@ class CVAE_LF(nn.Module):
         return r
 
 
+# ---------- CVAE ----------
+class CVAE_E3(CVAE):
+    """
+    SO(3) equivariant version of the CVAE. 
+    Standard prior N(0, I) and Gaussian encoder/decoder with diagonal covariances.
+    """
+    def __init__(self, zdim=3, system_type="dimer", cond_type="E3_base", hidden=(256,256)):
+
+        idim_map = {"dimer": 18}
+        cdim_map = {
+                "dimer": {
+                    "E3_base": 18
+                },
+            }
+        dim_maps = (idim_map, cdim_map)
+        super().__init__(zdim, system_type, cond_type, hidden, dim_maps)
+
+        self.N_vec = self.idim//2
+    
+    def prior_params(self, c=None, batch_shape=None, device=None, dtype=None):
+        """
+        Standard Gaussian prior:
+
+            p(z) = N(0, I)
+
+        Returns p_mu = 0, p_logvar = 0.
+
+        c is accepted only for API compatibility with the learned-prior version.
+        """
+        if c is not None:
+            shape = (*c.shape[:-1], self.zdim)
+            device = c.device
+            dtype = c.dtype
+        else:
+            assert batch_shape is not None, "Need either c or batch_shape."
+            shape = (*batch_shape, self.zdim)
+
+        p_mu = torch.zeros(shape, device=device, dtype=dtype)
+        p_logvar = torch.zeros(shape, device=device, dtype=dtype)
+
+        return p_mu, p_logvar
+    
+    # ----- sampling ----- #
+    @torch.no_grad()
+    def sample_torch(self, c, Tr=1.0, Tz=1.0):
+        """
+        Samples the decoder output from torch tensor, no (de)normalisation.
+        """
+        # samples z from p(z) ~ N(0,1)
+        z = torch.randn(
+            *c.shape[:-1],
+            self.zdim,
+            device=c.device,
+            dtype=c.dtype,
+        ) * Tz
+        
+        mu, log_sigma = self.decode(z, c)
+        r = mu + torch.exp(log_sigma) * torch.randn_like(mu) * Tr
+        return r
+    
+
+
+
 ### other classes ###
 class CVAE_FullGaussian(CVAE_LF):
 
@@ -353,76 +355,3 @@ class CVAE_FullGaussian(CVAE_LF):
         if return_stats:
             return r, (mu, L)
         return r
-
-# ---------- CVAE ----------
-class CVAE_MDN(CVAE_LF):
-    def __init__(self, zdim=3, system_type="bistable", cond_type="piri", hidden=(128,128)):
-        super().__init__(zdim, system_type, cond_type, hidden)
-        
-        assert system_type == "dimer"
-
-        self.K = 3
-        self.log_sig_min = -5.0
-        self.log_sig_max = 1.5
-
-        out_dim_dec = self.K + self.K * self.idim + self.K * self.idim
-        
-        # different decoder dimensionality compared to normal CVAE
-        self.decoder = MLP(zdim+self.cdim, out_dim=out_dim_dec, hidden=hidden)
-
-    def decode(self, z, c):
-        """
-        MDN decoder. Returns
-        -------
-        logit_pi : [B, K]
-        mu       : [B, K, idim]
-        log_sig  : [B, K, idim]
-        """
-        out = self.decoder(torch.cat([z, c], dim=-1))
-        B = out.shape[0]
-
-        i0 = self.K
-        i1 = i0 + self.K * self.idim
-        i2 = i1 + self.K * self.idim
-
-        logit_pi = out[:, :i0]                                # [B, K]
-        mu = out[:, i0:i1].view(B, self.K, self.idim)         # [B, K, idim]
-        log_sig = out[:, i1:i2].view(B, self.K, self.idim)    # [B, K, idim]
-
-        log_sig = torch.clamp(log_sig, self.log_sig_min, self.log_sig_max)
-
-        return logit_pi, mu, log_sig
-    
-    # ----- sampling ----- #
-    @torch.no_grad()
-    def sample_torch(self, c, Tr=1.0, Tz=1.0, return_component=False):
-        """
-        Sample r_next given normalized conditioning c.
-
-        Returns
-        -------
-        r_samp : [B, idim]
-        comp_idx : [B] if return_component=True
-        """
-        # samples z from p(z) ~ N(0,1)
-        z = torch.randn(
-            *c.shape[:-1],
-            self.zdim,
-            device=c.device,
-            dtype=c.dtype,
-        ) * Tz
-        
-        logit_pi, mu, log_sig = self.decode(z, c)   # [B,K], [B,K,D], [B,K,D]
-
-        pi = nn.functional.softmax(logit_pi, dim=-1)          # [B,K]
-        comp_idx = torch.multinomial(pi, num_samples=1).squeeze(-1)   # [B]
-
-        batch_idx = torch.arange(c.shape[0], device=c.device)
-        mu_sel = mu[batch_idx, comp_idx, :]               # [B,D]
-        log_sig_sel = log_sig[batch_idx, comp_idx, :]     # [B,D]
-
-        r_samp = mu_sel + torch.exp(log_sig_sel) * torch.randn_like(mu_sel) * Tr
-
-        if return_component:
-            return r_samp, comp_idx
-        return r_samp

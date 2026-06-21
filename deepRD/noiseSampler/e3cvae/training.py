@@ -1,172 +1,143 @@
-import torch
 import copy
-from tqdm import tqdm
-from torch import nn
+import torch
 import torch.optim as optim
-from deepRD.noiseSampler.cvae.losses import elbo_loss, reweight_losses
+from tqdm import tqdm
+
+from .losses import e3_cvae_axial_loss
 
 
-"""
-Training and evaluation loops for CVAE.
-"""
-
-def flatten_batch_time(x: torch.Tensor):
+def move_graph_batch_to_device(batch, device):
     """
-    Flatten [B, L, D...] → [B*L, D...]
-    Leave [B, D...] unchanged.
+    Move an E3 graph batch dictionary to a torch device.
+
+    Tensor values are moved; non-tensor metadata such as num_graphs is kept.
     """
-    if x.dim() <= 2:
-        return x
-    # x: [B, L, ...]
-    B, L = x.shape[:2]
-    return x.reshape(B * L, *x.shape[2:])
+    return {
+        key: value.to(device) if torch.is_tensor(value) else value
+        for key, value in batch.items()
+    }
 
-def train_cvae(model, train_loader, val_loader=None,
-               epochs=50,
-               lr=1e-3,
-               beta_max=1.0, 
-               free_bits=0.0, 
-               warmup_epochs=10,
-               grad_clip=1.0, save_path=None,
-               early_stopping=True, patience=10, min_delta=1e-3,
-               validate_every=1,
-               weights_for_training=False,
-               device='cpu'):
 
-    train_total, train_nll, train_kl = [], [], []
-    val_total, val_nll, val_kl = [], [], []
+def beta_schedule(epoch, beta_max=1.0, warmup_epochs=10):
+    if warmup_epochs <= 0:
+        return beta_max
+    return beta_max * min(1.0, epoch / warmup_epochs)
 
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+def train_e3_cvae(
+    model,
+    train_loader,
+    val_loader=None,
+    epochs=50,
+    lr=1e-3,
+    beta_max=1.0,
+    warmup_epochs=10,
+    grad_clip=1.0,
+    weight_decay=1e-4,
+    save_path=None,
+    early_stopping=True,
+    patience=10,
+    min_delta=1e-3,
+    validate_every=1,
+    device="cpu",
+):
+    """
+    Train E3DimerCVAE on graph batches.
+
+    Each loader item must be a dict with at least:
+        h_enc:       [B*2, encoder_irreps.dim]
+        h_dec_base:  [B*2, decoder_base_irreps.dim]
+        edge_index:  [2, 2*B]
+        edge_vec:    [2*B, 3]
+        edge_radial: [2*B, radial_dim]
+        batch_index: [B*2]
+        r_next:      [B*2, 3]
+        num_graphs:  int
+    """
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    scaler = torch.amp.GradScaler('cuda')
+
+    history = {
+        "train_total": [],
+        "train_nll": [],
+        "train_kl": [],
+        "val_total": [],
+        "val_nll": [],
+        "val_kl": [],
+        "val_diagnostics": [],
+        "best_val_loss": None,
+        "best_epoch": None,
+    }
 
     best_val_loss = float("inf")
-    best_epoch = None
     best_state = None
     epochs_no_improve = 0
 
-
-    # Using per-sample losses for training weights
-
     for epoch in range(1, epochs + 1):
-
-        # ---- KL warm-up ----
-        if epoch <= warmup_epochs:
-            beta = beta_max * (epoch / warmup_epochs)
-        else:
-            beta = beta_max
-
+        beta = beta_schedule(epoch, beta_max=beta_max, warmup_epochs=warmup_epochs)
         model.train()
-        total_loss, total_nll, total_kl = 0.0, 0.0, 0.0
 
-        loop = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
+        total_loss = total_nll = total_kl = 0.0
+        loop = tqdm(train_loader, desc=f"E3 epoch {epoch}/{epochs}")
         for batch in loop:
-            
-            if weights_for_training==True:
-                per_sample=True
-                r_next, c, w = [x.to(device) for x in batch]
-                w = flatten_batch_time(w).squeeze(-1)
-
-            else:
-                per_sample=False
-                r_next, c = [x.to(device) for x in batch]
-
-            r_next = flatten_batch_time(r_next)
-            c = flatten_batch_time(c)
-
+            batch = move_graph_batch_to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast('cuda'):
-                dec_out, q, p = model(r_next, c)
-                loss, nll, kl = elbo_loss(
-                                        r_next, dec_out, q, p, 
-                                        beta,
-                                        per_sample=per_sample,
-                                        free_bits=free_bits
-                                        )
-                
-                if weights_for_training==True:
-                    loss, nll, kl = reweight_losses([loss, nll, kl], w)
-
-            scaler.scale(loss).backward()
+            outputs = model(batch)
+            loss, nll, kl = e3_cvae_axial_loss(outputs, batch, beta=beta)
+            loss.backward()
 
             if grad_clip is not None:
-                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
 
             total_loss += loss.item()
             total_nll += nll.item()
             total_kl += kl.item()
-
             loop.set_postfix(
                 loss=f"{loss.item():.4f}",
                 NLL=f"{nll.item():.4f}",
                 KL=f"{kl.item():.4f}",
-                beta=f"{beta:.3f}"
+                beta=f"{beta:.3f}",
             )
 
         scheduler.step()
 
-        avg_train_loss = total_loss / len(train_loader)
-        avg_train_nll = total_nll / len(train_loader)
-        avg_train_kl = total_kl / len(train_loader)
-
-        train_total.append(avg_train_loss)
-        train_nll.append(avg_train_nll)
-        train_kl.append(avg_train_kl)
+        avg_loss = total_loss / len(train_loader)
+        avg_nll = total_nll / len(train_loader)
+        avg_kl = total_kl / len(train_loader)
+        history["train_total"].append(avg_loss)
+        history["train_nll"].append(avg_nll)
+        history["train_kl"].append(avg_kl)
 
         print(
-            f"Epoch {epoch}: "
-            f"train_total={avg_train_loss:.4f}, "
-            f"train_nll={avg_train_nll:.4f}, "
-            f"train_kl={avg_train_kl:.4f}, "
-            f"beta={beta:.4f}"
+            f"Epoch {epoch}: train_total={avg_loss:.4f}, "
+            f"train_nll={avg_nll:.4f}, train_kl={avg_kl:.4f}, beta={beta:.4f}"
         )
 
-        # ---- validation ----
-        do_validate = (
-            val_loader is not None and
-            epoch % validate_every == 0
-        )
-
-        if do_validate:
-            val_metrics = evaluate_cvae(
-                                        model, 
-                                        val_loader, 
-                                        beta,
-                                        return_parts=True, 
-                                        per_sample=per_sample, 
-                                        device=device
-                                        )
-
-            avg_val_loss = val_metrics["total"]
-            avg_val_nll = val_metrics["nll"]
-            avg_val_kl = val_metrics["kl"]
-
-            val_total.append(avg_val_loss)
-            val_nll.append(avg_val_nll)
-            val_kl.append(avg_val_kl)
-
+        if val_loader is not None and epoch % validate_every == 0:
+            val_metrics = evaluate_e3_cvae(model, val_loader, beta=beta, device=device)
+            history["val_total"].append(val_metrics["total"])
+            history["val_nll"].append(val_metrics["nll"])
+            history["val_kl"].append(val_metrics["kl"])
+            history["val_diagnostics"].append(val_metrics)
             print(
-                f"Validation: "
-                f"val_total={avg_val_loss:.4f}, "
-                f"val_nll={avg_val_nll:.4f}, "
-                f"val_kl={avg_val_kl:.4f}"
+                f"Validation: val_total={val_metrics['total']:.4f}, "
+                f"val_nll={val_metrics['nll']:.4f}, val_kl={val_metrics['kl']:.4f}, "
+                f"rmse={val_metrics['rmse']:.4f}, "
+                f"logsig_para={val_metrics['log_sigma_para_mean']:.3f}, "
+                f"logsig_perp={val_metrics['log_sigma_perp_mean']:.3f}"
             )
 
-            # ---- early stopping only AFTER warmup ----
             if early_stopping and epoch > warmup_epochs:
-                improved = (best_val_loss - avg_val_loss) > min_delta
-
+                improved = best_val_loss - val_metrics["total"] > min_delta
                 if improved:
-                    best_val_loss = avg_val_loss
-                    best_epoch = epoch
+                    best_val_loss = val_metrics["total"]
+                    history["best_val_loss"] = best_val_loss
+                    history["best_epoch"] = epoch
                     best_state = copy.deepcopy(model.state_dict())
                     epochs_no_improve = 0
-
                     if save_path is not None:
                         torch.save(
                             {
@@ -175,83 +146,92 @@ def train_cvae(model, train_loader, val_loader=None,
                                 "best_val_loss": best_val_loss,
                                 "beta": beta,
                             },
-                            save_path
+                            save_path,
                         )
                 else:
                     epochs_no_improve += 1
-                    print(f"No significant val improvement for {epochs_no_improve} epoch(s).")
-
                     if epochs_no_improve >= patience:
                         print(
-                            f"Early stopping triggered at epoch {epoch}. "
-                            f"Best epoch was {best_epoch} with val_total={best_val_loss:.4f}."
+                            f"Early stopping at epoch {epoch}; "
+                            f"best epoch was {history['best_epoch']}."
                         )
                         break
-
-        # if no validation / no early stopping, optionally still save latest
         elif save_path is not None and not early_stopping:
             torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state": model.state_dict(),
-                    "beta": beta,
-                },
-                save_path
+                {"epoch": epoch, "model_state": model.state_dict(), "beta": beta},
+                save_path,
             )
 
-    # ---- restore best model if early stopping used ----
     if best_state is not None:
         model.load_state_dict(best_state)
-        print(f"Restored best model from epoch {best_epoch} (val_total={best_val_loss:.4f}).")
 
-    return {
-        "train_total": train_total,
-        "train_nll": train_nll,
-        "train_kl": train_kl,
-        "val_total": val_total,
-        "val_nll": val_nll,
-        "val_kl": val_kl,
-        "best_val_loss": best_val_loss if best_epoch is not None else None,
-        "best_epoch": best_epoch,
-    }
+    return history
+
 
 @torch.no_grad()
-def evaluate_cvae(model, val_loader, beta, return_parts=False, per_sample=False, device='cpu'):
+def evaluate_e3_cvae(model, loader, beta=1.0, device="cpu"):
     model.eval()
+    total_loss = total_nll = total_kl = 0.0
+    se_sum = 0.0
+    y2_sum = 0.0
+    mu2_sum = 0.0
+    sample2_sum = 0.0
+    vector_count = 0
+    node_count = 0
+    z_count = 0
+    z_mu2_sum = 0.0
+    z_logvar_sum = 0.0
+    log_sigma_para_sum = 0.0
+    log_sigma_perp_sum = 0.0
+    sigma_para_sum = 0.0
+    sigma_perp_sum = 0.0
 
-    total_loss, total_nll, total_kl = 0.0, 0.0, 0.0
-
-    for batch in val_loader:
-
-        if per_sample==True:
-            r_next, c, w = [x.to(device) for x in batch]
-            w = flatten_batch_time(w).squeeze(-1)
-        else:
-            r_next, c = [x.to(device) for x in batch]
-
-        r_next = flatten_batch_time(r_next)
-        c = flatten_batch_time(c)
-
-        with torch.amp.autocast('cuda'):
-            dec_out, q, p = model(r_next, c)
-            loss, nll, kl = elbo_loss(r_next, dec_out, q, p, beta, per_sample=per_sample)
-
-            if per_sample==True:
-                loss, nll, kl = reweight_losses([loss, nll, kl], w)
-
+    for batch in loader:
+        batch = move_graph_batch_to_device(batch, device)
+        outputs = model(batch)
+        loss, nll, kl = e3_cvae_axial_loss(outputs, batch, beta=beta)
         total_loss += loss.item()
         total_nll += nll.item()
         total_kl += kl.item()
 
-    avg_loss = total_loss / len(val_loader)
-    avg_nll = total_nll / len(val_loader)
-    avg_kl = total_kl / len(val_loader)
+        y = batch["r_next"]
+        mu = outputs["mu"]
+        log_sigma = outputs["log_sigma"]
+        sample, _, _ = model.sample_torch(batch)
 
-    if return_parts:
-        return {
-            "total": avg_loss,
-            "nll": avg_nll,
-            "kl": avg_kl,
-        }
-    else:
-        return avg_loss
+        se_sum += (mu - y).pow(2).sum().item()
+        y2_sum += y.pow(2).sum().item()
+        mu2_sum += mu.pow(2).sum().item()
+        sample2_sum += sample.pow(2).sum().item()
+        vector_count += y.numel()
+
+        log_sigma_para = log_sigma[:, 0]
+        log_sigma_perp = log_sigma[:, 1]
+        node_count += log_sigma.shape[0]
+        log_sigma_para_sum += log_sigma_para.sum().item()
+        log_sigma_perp_sum += log_sigma_perp.sum().item()
+        sigma_para_sum += torch.exp(log_sigma_para).sum().item()
+        sigma_perp_sum += torch.exp(log_sigma_perp).sum().item()
+
+        z_mu = outputs["z_mu"]
+        z_logvar = outputs["z_logvar"]
+        z_count += z_mu.numel()
+        z_mu2_sum += z_mu.pow(2).sum().item()
+        z_logvar_sum += z_logvar.sum().item()
+
+    n_batches = len(loader)
+    return {
+        "total": total_loss / n_batches,
+        "nll": total_nll / n_batches,
+        "kl": total_kl / n_batches,
+        "rmse": (se_sum / max(vector_count, 1)) ** 0.5,
+        "target_rms": (y2_sum / max(vector_count, 1)) ** 0.5,
+        "mu_rms": (mu2_sum / max(vector_count, 1)) ** 0.5,
+        "sample_rms": (sample2_sum / max(vector_count, 1)) ** 0.5,
+        "log_sigma_para_mean": log_sigma_para_sum / max(node_count, 1),
+        "log_sigma_perp_mean": log_sigma_perp_sum / max(node_count, 1),
+        "sigma_para_mean": sigma_para_sum / max(node_count, 1),
+        "sigma_perp_mean": sigma_perp_sum / max(node_count, 1),
+        "z_mu_rms": (z_mu2_sum / max(z_count, 1)) ** 0.5,
+        "z_logvar_mean": z_logvar_sum / max(z_count, 1),
+    }

@@ -24,7 +24,7 @@ class E3InvariantEncoder(nn.Module):
     def __init__(self, zdim, hidden_irreps="32x0e + 16x1o + 8x2e"):
         super().__init__()
 
-        self.irreps_in = o3.Irreps("5x1o + 4x0e")
+        self.irreps_in = o3.Irreps("5x1o + 5x0e")
         self.irreps_hidden = o3.Irreps(hidden_irreps)
 
         self.layers = nn.ModuleList([

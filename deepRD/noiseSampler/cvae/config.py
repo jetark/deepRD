@@ -38,6 +38,7 @@ class ModelSection:
     activation: str = "silu"
     layer_norm: bool = True
     standard_prior: bool = True
+    hidden_irreps: str | None = None
 
 
 @dataclass
@@ -110,7 +111,9 @@ def build_model_from_config(config: CVAEConfig):
     if config.model.model_type == "CVAE":
         from deepRD.noiseSampler.cvae.models import CVAE as model_class
     elif config.model.model_type == "CVAE_LF":
-        from deepRD.noiseSampler.cvae.models import CVAE_LF as model_class
+        from deepRD.noiseSampler.cvaeSampler import CVAE_LF as model_class
+    elif config.model.model_type == "CVAE_MDN":
+        from deepRD.noiseSampler.cvaeSampler import CVAE_LF as model_class
     elif config.model.model_type == "CVAE_Inv":
         from deepRD.noiseSampler.cvaeSampler import CVAE_Inv as model_class
     elif config.model.model_type == "CVAE_E3":
@@ -126,3 +129,32 @@ def build_model_from_config(config: CVAEConfig):
     )
 
     return model
+
+
+def build_model_from_config_e3(config: CVAEConfig):
+    """
+    Build the e3nn-based E3DimerCVAE from the shared CVAEConfig schema.
+
+    This intentionally accepts only the subset currently meaningful for the
+    graph E3 model. The flat input_dim/hidden_dims fields are retained in the
+    config for compatibility with existing YAMLs, but E3DimerCVAE uses
+    latent_dim and an optional hidden_irreps attribute instead.
+    """
+    if config.model.model_type not in ("E3DimerCVAE", "CVAE_E3NN", "E3_CVAE"):
+        raise ValueError(
+            "build_model_from_config_e3 expects model_type in "
+            "{'E3DimerCVAE', 'CVAE_E3NN', 'E3_CVAE'}, got "
+            f"{config.model.model_type!r}"
+        )
+    if config.system.system_type != "dimer":
+        raise ValueError("E3DimerCVAE currently supports only system_type='dimer'.")
+    if config.data.conditioning != "dqpipimririm":
+        raise ValueError("E3DimerCVAE currently expects conditioning='dqpipimririm'.")
+
+    from deepRD.noiseSampler.e3cvae.model import E3DimerCVAE
+
+    hidden_irreps = config.model.hidden_irreps or "32x0e + 16x1o + 8x2e"
+    return E3DimerCVAE(
+        zdim=config.model.latent_dim,
+        hidden_irreps=hidden_irreps,
+    )

@@ -22,17 +22,16 @@ class E3EquivariantDecoder(nn.Module):
 
         self.vector_head = o3.Linear(self.irreps_hidden, "1x1o")
 
-        # Isotropic version: one scalar sigma per node.
-        self.sigma_head = o3.Linear(self.irreps_hidden, "1x0e")
-
-        # If using parallel/perp covariance, use:
-        # self.sigma_head = o3.Linear(self.irreps_hidden, "2x0e")
+        # Two invariant log scales per node:
+        #   column 0: parallel to the bond axis
+        #   column 1: perpendicular to the bond axis
+        self.sigma_head = o3.Linear(self.irreps_hidden, "2x0e")
 
     def forward(self, h, edge_index, edge_vec, edge_radial):
         for layer in self.layers:
             h = layer(h, edge_index, edge_vec, edge_radial)
 
         mu = self.vector_head(h)          # [B*2, 3]
-        log_sigma = self.sigma_head(h)    # [B*2, 1]
+        log_sigma = self.sigma_head(h)    # [B*2, 2]
 
         return mu, log_sigma

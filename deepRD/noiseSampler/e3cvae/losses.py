@@ -1,10 +1,12 @@
 import math
 import torch
+from .axial_covariance import axial_vector_nll, bond_unit_from_edge_vec
 
 def isotropic_vector_nll(y, mu, log_sigma):
     """
     y, mu: [B*2, 3]
     log_sigma: [B*2, 1]
+    returns per-node 3D vector NLL: [B*2]
     """
     diff2 = (y - mu).pow(2).sum(dim=-1, keepdim=True)
     inv_var = torch.exp(-2.0 * log_sigma)
@@ -23,32 +25,46 @@ def standard_gaussian_kl(z_mu, z_logvar):
         dim=-1,
     )
 
-def axial_vector_nll(y, mu, bond_unit, log_sigma_para, log_sigma_perp):
+def e3_cvae_axial_loss(outputs, batch, beta=1.0):
     """
-    y, mu: [B*2, 3]
-    bond_unit: [B*2, 3]
-        For bead 1 and bead 2, you can use the same bond direction
-        or signed directions depending on your convention.
-    log_sigma_para, log_sigma_perp: [B*2]
+    Graph-level E3 CVAE loss using the axial vector Gaussian decoder.
+
+    Each graph has two 3D bead targets. The per-node axial NLL is a full 3D
+    vector likelihood (1 parallel + 2 perpendicular dimensions), and the graph
+    NLL sums both bead terms, so each graph contributes a 6D observation
+    likelihood before averaging across the batch.
+
+    outputs:
+        "mu":             [B*2, 3]
+        "log_sigma":      [B*2, 2], columns are parallel/perpendicular
+        "z_mu":           [B, zdim]
+        "z_logvar":       [B, zdim]
+    batch:
+        "r_next":         [B*2, 3]
+        "edge_vec":       [2*B, 3]
+        "num_graphs":     int
+        optional "bond_unit_node": [B*2, 3]
     """
-    diff = y - mu
+    mu = outputs["mu"]
+    log_sigma = outputs["log_sigma"]
+    y = batch["r_next"]
+    B = batch["num_graphs"]
 
-    d_para = (diff * bond_unit).sum(dim=-1)
-    diff_para = d_para[:, None] * bond_unit
-    diff_perp = diff - diff_para
+    bond_unit = batch.get("bond_unit_node")
+    if bond_unit is None:
+        bond_unit = bond_unit_from_edge_vec(batch["edge_vec"], B)
 
-    para2 = d_para.pow(2)
-    perp2 = diff_perp.pow(2).sum(dim=-1)
-
-    inv_para = torch.exp(-2.0 * log_sigma_para)
-    inv_perp = torch.exp(-2.0 * log_sigma_perp)
-
-    nll = 0.5 * (
-        para2 * inv_para
-        + perp2 * inv_perp
-        + 2.0 * log_sigma_para
-        + 4.0 * log_sigma_perp
-        + 3.0 * math.log(2.0 * math.pi)
+    nll_node = axial_vector_nll(
+        y,
+        mu,
+        bond_unit,
+        log_sigma[:, 0:1],
+        log_sigma[:, 1:2],
     )
+    nll_graph = nll_node.reshape(B, 2).sum(dim=-1)  # [B], two 3D beads per graph
+    kl_graph = standard_gaussian_kl(outputs["z_mu"], outputs["z_logvar"])
 
-    return nll
+    nll = nll_graph.mean()
+    kl = kl_graph.mean()
+    loss = nll + beta * kl
+    return loss, nll, kl
