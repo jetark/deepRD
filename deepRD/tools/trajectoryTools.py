@@ -396,7 +396,6 @@ def rotateVecInverse(unitvec, vec):
     vec = rotateZaxis(vec, phi)
     return vec
 
-
 def rotateXaxis(vec, theta):
     rotMatrix = np.array([[1, 0, 0],
                           [np.cos(theta), -np.sin(theta), 0],
@@ -492,26 +491,82 @@ def build_local_frame(
 
 def to_local(R: torch.Tensor, v_xyz: torch.Tensor) -> torch.Tensor:
     """
-    Convert vectors from lab xyz to local frame.
+    Convert one or more concatenated 3D lab-frame vectors to local frame.
 
-    R: (..., 3, 3) with columns [e1,e2,e3] in xyz
-    v_xyz: (..., 3)
-    returns v_local: (..., 3)
+    Args
+    ----
+    R : (..., 3, 3)
+        Rotation matrix with columns [e1, e2, e3] in lab coords.
+    v_xyz : (..., 3*K)
+        One or more concatenated 3D vectors in lab xyz coordinates.
+
+    Returns
+    -------
+    v_local : (..., 3*K)
+        Same shape as v_xyz, with each 3D block transformed as R^T @ v.
     """
-    # v_local = R^T v_xyz
-    return (R.transpose(-2, -1) @ v_xyz.unsqueeze(-1)).squeeze(-1)
+    if v_xyz.shape[-1] % 3 != 0:
+        raise ValueError(
+            f"Last dimension of v_xyz must be a multiple of 3, got {v_xyz.shape[-1]}"
+        )
 
+    original_shape = v_xyz.shape
+    k = original_shape[-1] // 3
+
+    # (..., 3*K) -> (..., K, 3)
+    v_blocks = v_xyz.reshape(*original_shape[:-1], k, 3)
+
+    # Need R to broadcast over the K vector blocks.
+    # R:        (..., 3, 3)
+    # R_T:      (..., 3, 3)
+    # R_T_exp:  (..., 1, 3, 3)
+    # v_exp:    (..., K, 3, 1)
+    v_local = (
+        R.transpose(-2, -1).unsqueeze(-3)
+        @ v_blocks.unsqueeze(-1)
+    ).squeeze(-1)
+
+    # (..., K, 3) -> (..., 3*K)
+    return v_local.reshape(*original_shape)
 
 def to_xyz(R: torch.Tensor, v_local: torch.Tensor) -> torch.Tensor:
     """
-    Convert vectors from local frame to lab xyz.
+    Convert one or more concatenated 3D local-frame vectors to lab frame.
 
-    R: (..., 3, 3)
-    v_local: (..., 3)
-    returns v_xyz: (..., 3)
+    Args
+    ----
+    R : (..., 3, 3)
+        Rotation matrix with columns [e1, e2, e3] in lab coords.
+    v_local : (..., 3*K)
+        One or more concatenated 3D vectors in local coordinates.
+
+    Returns
+    -------
+    v_xyz : (..., 3*K)
+        Same shape as v_local, with each 3D block transformed as R @ v.
     """
-    # v_xyz = R v_local
-    return (R @ v_local.unsqueeze(-1)).squeeze(-1)
+    if v_local.shape[-1] % 3 != 0:
+        raise ValueError(
+            f"Last dimension of v_local must be a multiple of 3, got {v_local.shape[-1]}"
+        )
+
+    original_shape = v_local.shape
+    k = original_shape[-1] // 3
+
+    # (..., 3*K) -> (..., K, 3)
+    v_blocks = v_local.reshape(*original_shape[:-1], k, 3)
+
+    # R:       (..., 3, 3)
+    # R_exp:   (..., 1, 3, 3)
+    # v_exp:   (..., K, 3, 1)
+    v_xyz = (
+        R.unsqueeze(-3)
+        @ v_blocks.unsqueeze(-1)
+    ).squeeze(-1)
+
+    # (..., K, 3) -> (..., 3*K)
+    return v_xyz.reshape(*original_shape)
+    
 
 def dimer_rel_com(a1: torch.Tensor, a2: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
