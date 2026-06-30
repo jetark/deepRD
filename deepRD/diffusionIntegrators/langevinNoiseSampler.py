@@ -811,6 +811,8 @@ class langevinNoiseSamplerDimerGlobal(langevinNoiseSamplerDimer):
             return np.concatenate((particle1.nextPosition, particle2.nextPosition, np.array([self.relDistance[index]]), particle1.nextVelocity, particle2.nextVelocity, particle1.aux3, particle2.aux3, particle1.aux1, particle2.aux1, particle1.aux2, particle2.aux2))
         elif self.conditionedOn in ('local_dqidpipipimririm'):
             return np.concatenate((particle1.nextPosition, particle2.nextPosition, np.array([self.relDistance[index]]), np.array([self.axisRelVelocity[index]]), particle1.nextVelocity, particle2.nextVelocity, particle1.aux3, particle2.aux3, particle1.aux1, particle2.aux1, particle1.aux2, particle2.aux2))
+        elif self.conditionedOn in ('local_dqidpipimmrimm'):
+            return np.concatenate((particle1.nextPosition, particle2.nextPosition, np.array([self.relDistance[index]]), np.array([self.axisRelVelocity[index]]), particle1.nextVelocity, particle2.nextVelocity, particle1.aux3, particle2.aux3, particle1.vel1, particle2.vel1, particle1.aux1, particle2.aux1, particle1.aux2, particle2.aux2, particle1.aux4, particle2.aux4))
         elif self.conditionedOn == 'relcom_pipimdqiririm':
             return np.concatenate((particle1.nextVelocity, particle2.nextVelocity, particle1.aux3, particle2.aux3, np.array([self.relDistance[index]]), particle1.aux1, particle2.aux1, particle1.aux2, particle2.aux2))
         else:
@@ -851,8 +853,7 @@ class langevinNoiseSamplerDimerGlobal(langevinNoiseSamplerDimer):
             # Rotate back riplus if needed
             interactionNoiseTerm1 = interactionNoiseTerm[0:3]
             interactionNoiseTerm2 = interactionNoiseTerm[3:6]
-            #interactionNoiseTerm1 = trajectoryTools.rotateVecInverse(self.relPosition[2*i], rotatedInteractionNoiseTerm[0:3])
-            #interactionNoiseTerm2 = trajectoryTools.rotateVecInverse(self.relPosition[2*i], rotatedInteractionNoiseTerm[3:6])
+
 
             ## For testing and consistency.
             #xi = np.sqrt(self.kBT * particle.mass * (1 - np.exp(-2 * self.Gamma * dt / particle.mass)))
@@ -866,8 +867,8 @@ class langevinNoiseSamplerDimerGlobal(langevinNoiseSamplerDimer):
             #particleList[2*i].aux5 = 1.0 * particleList[2*i].aux4
             #particleList[2*i+1].aux5 = 1.0 * particleList[2*i+1].aux4
 
-            #particleList[2*i].aux4 = 1.0 * particleList[2*i].aux2
-            #particleList[2*i+1].aux4 = 1.0 * particleList[2*i+1].aux2
+            particleList[2*i].aux4 = 1.0 * particleList[2*i].aux2
+            particleList[2*i+1].aux4 = 1.0 * particleList[2*i+1].aux2
 
             particleList[2*i].aux2 = 1.0 * particleList[2*i].aux1
             particleList[2*i+1].aux2 = 1.0 * particleList[2*i+1].aux1
@@ -879,8 +880,8 @@ class langevinNoiseSamplerDimerGlobal(langevinNoiseSamplerDimer):
             #particleList[2 * i].vel2 = 1.0 * particleList[2*i].vel1
             #particleList[2 * i + 1].vel2 = 1.0 * particleList[2*i+1].vel1
 
-            #particleList[2 * i].vel1 = 1.0 * particleList[2*i].aux3
-            #particleList[2 * i + 1].vel1 = 1.0 * particleList[2*i+1].aux3
+            particleList[2 * i].vel1 = 1.0 * particleList[2*i].aux3
+            particleList[2 * i + 1].vel1 = 1.0 * particleList[2*i+1].aux3
 
             particleList[2 * i].aux3 = 1.0 * particleList[2*i].nextVelocity
             particleList[2 * i + 1].aux3 = 1.0 * particleList[2*i+1].nextVelocity

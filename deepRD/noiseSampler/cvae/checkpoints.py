@@ -23,6 +23,25 @@ def load_run(run_dir, map_location="cpu"):
 
     return config, model, scalers
 
+def make_run_dir(base_dir, conditioning, tag, overwrite=False):
+    cond_dir = Path(base_dir) / conditioning
+    cond_dir.mkdir(parents=True, exist_ok=True)
+
+    if overwrite:
+        run_dir = cond_dir / tag
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
+
+    existing = [
+        p for p in cond_dir.iterdir()
+        if p.is_dir() and p.name[:3].isdigit()
+    ]
+
+    run_num = len(existing) + 1
+    run_dir = cond_dir / f"{run_num:03d}_{tag}"
+    run_dir.mkdir()
+
+    return run_dir
 
 def create_run_dir(config_or_path: CVAEConfig | str | Path, output_root: str | Path | None = None) -> Path:
     if isinstance(config_or_path, CVAEConfig):

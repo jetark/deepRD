@@ -21,10 +21,12 @@ def extract_0e(x, irreps):
     return torch.cat(parts, dim=-1)
 
 class E3InvariantEncoder(nn.Module):
-    def __init__(self, zdim, hidden_irreps="32x0e + 16x1o + 8x2e"):
+    def __init__(self, zdim, hidden_irreps="32x0e + 16x1o + 8x2e", lag2=False):
         super().__init__()
 
-        self.irreps_in = o3.Irreps("5x1o + 5x0e")
+        # Base: 5 vector inputs (v_n, v_nm1, r_n, r_nm1, r_next); lag2 adds v_nm2 and r_nm2
+        n_vecs = 7 if lag2 else 5
+        self.irreps_in = o3.Irreps(f"{n_vecs}x1o + {n_vecs}x0e")
         self.irreps_hidden = o3.Irreps(hidden_irreps)
 
         self.layers = nn.ModuleList([

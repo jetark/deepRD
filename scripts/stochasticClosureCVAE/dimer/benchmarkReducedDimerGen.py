@@ -60,15 +60,15 @@ conditionedOn = 'local_dqipipimririm' #'pi'
 outputAux = True #False
 nbins = 5
 
-prefix = "" # prefixes: "" (empty) or DX, SP, lambda, CondGaussMixK5, FG, ar, ar-mlp, 512, etc.
-modelsuffix = "_DAG2"
-directorysuffix = "_DAG2"
+prefix = "MDN" # prefixes: "" (empty) or DX, SP, lambda, CondGaussMixK5, FG, ar, ar-mlp, 512, etc.
+modelsuffix = ""
+directorysuffix = ""
 
 # Output data directory
 if prefix == "":
-    foldername = f'dimerGlobal/boxsize{bsize}/benchmarkReducedGen_{conditionedOn}{directorysuffix}'
+    foldername = f'dimerGlobal/boxsize{bsize}/cvaeRuns/{conditionedOn}{directorysuffix}'
 else:
-    foldername = f'dimerGlobal/boxsize{bsize}/benchmarkReducedGen_{prefix}_{conditionedOn}{directorysuffix}'
+    foldername = f'dimerGlobal/boxsize{bsize}/cvaeRuns/{prefix}_{conditionedOn}{directorysuffix}'
 
 # Define noise sampler
 localModelDirectory = 'deepRD/noiseSampler/training/dev/'
@@ -158,9 +158,9 @@ def runParallelSims(simnumber):
     hidd = 256
     Tr, Tz = (1, 1) # (r, z) resampling temperature
 
-    #nSampler = cvaeSampler.CVAE(zdim=zdim, system_type=systemType, cond_type=conditionedOn, hidden=(hidd, hidd))
-    nSampler = cvaeSampler.CVAE_LF(zdim=zdim, system_type=systemType, cond_type=conditionedOn, hidden=(hidd, hidd))
-    #nSampler = cvaeSampler.CVAE_MDN(zdim=zdim, system_type=systemType, cond_type=conditionedOn, hidden=(hidd, hidd))
+    #nSampler = cvaeSampler.CVAESampler(zdim=zdim, system_type=systemType, cond_type=conditionedOn, hidden=(hidd, hidd))
+    #nSampler = cvaeSampler.CVAE_LF(zdim=zdim, system_type=systemType, cond_type=conditionedOn, hidden=(hidd, hidd))
+    nSampler = cvaeSampler.CVAE_MDN(zdim=zdim, system_type=systemType, cond_type=conditionedOn, hidden=(hidd, hidd))
     #nSampler = cvaeSampler.CVAE_FullGaussian(zdim=zdim, system_type=systemType, cond_type=conditionedOn, hidden=(hidd, hidd))
     #nSampler = cvaeSampler.CVAE_DX(zdim=zdim, system_type=systemType, cond_type=conditionedOn, hidden=(hidd, hidd))
     #nSampler = cvaeSampler.CVAE_SP(zdim=zdim, system_type=systemType, cond_type=conditionedOn, hidden=(hidd, hidd))
@@ -194,28 +194,17 @@ def runParallelSims(simnumber):
 
     # Define pair potential
     pairBistablePotential = pairBistable(x0, rad, scalefactor)
-    #pairBistablePotential = pairBistableBias(x0, rad, scalefactor)
 
-    #diffIntegrator = langevinNoiseSampler(dt, integratorStride, tfinal, Gamma, nSampler, KbT, boxsize,
-    #                                      boundaryType, equilibrationSteps, conditionedOn)
-    #diffIntegrator = langevinNoiseSamplerDimer(dt, integratorStride, tfinal, Gamma, nSampler, KbT, boxsize,
-    #                                      boundaryType, equilibrationSteps, conditionedOn)
-    #diffIntegrator = langevinNoiseSamplerDimer2(dt, integratorStride, tfinal, Gamma, nSampler, KbT, boxsize,
-    #                                      boundaryType, equilibrationSteps, conditionedOn)
-    #diffIntegrator = langevinNoiseSamplerDimer3(dt, integratorStride, tfinal, Gamma, nSampler, KbT, boxsize,
-    #                                            boundaryType, equilibrationSteps, conditionedOn)
     diffIntegrator = langevinNoiseSamplerDimerGlobal(dt, integratorStride, tfinal, Gamma, nSampler, KbT, boxsize,
                                           boundaryType, equilibrationSteps, conditionedOn)
 
     diffIntegrator.setPairPotential(pairBistablePotential)
 
     # Integrate dynamics
-    #t, X, V = diffIntegrator.propagate(particleList, outputAux = outputAux)
     t, X, V, Raux = diffIntegrator.propagate(particleList, outputAux = outputAux)
 
 
     # Write dynamics into trjactory
-    #traj = trajectoryTools.convert2trajectory(t, [X, V])
     traj = trajectoryTools.convert2trajectory(t, [X, V, Raux])
     trajectoryTools.writeTrajectory(traj,basefilename,simnumber)
 

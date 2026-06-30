@@ -21,6 +21,7 @@ class SystemSection:
 @dataclass
 class DataSection:
     conditioning: str
+    n_lags: int
     train_trajectories: int
     val_fraction: float
     dataset_dir: str | None = None
@@ -34,11 +35,14 @@ class ModelSection:
     model_type: str
     input_dim: int
     latent_dim: int
+    cond_dim: int
     hidden_dims: list[int]
     activation: str = "silu"
     layer_norm: bool = True
     standard_prior: bool = True
     hidden_irreps: str | None = None
+    isotropic: bool = False
+    lag2: bool = False
 
 
 @dataclass
@@ -157,4 +161,6 @@ def build_model_from_config_e3(config: CVAEConfig):
     return E3DimerCVAE(
         zdim=config.model.latent_dim,
         hidden_irreps=hidden_irreps,
+        isotropic=getattr(config.model, "isotropic", False),
+        lag2=getattr(config.model, "lag2", False),
     )

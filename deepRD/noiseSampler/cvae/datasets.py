@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import os
 import deepRD.tools.trajectoryTools as trajectoryTools
 import deepRD.tools.analysisTools as analysisTools
 from deepRD.noiseSampler.cvae.transforms import minimal_image_rel, compute_axisRelVel, compute_dx_dvx, to_local, build_local_frame
@@ -265,7 +266,10 @@ def build_conditioning_and_scalers(
             raise ValueError("For 'dimer', time dimension must be even (alternating p1/p2 samples).")
         T = T2 // 2
 
-        r_next, c = construct_rc_dimer(q, v, r, cond_type)
+        if cond_type.startswith("local_"):
+            r_next, c = construct_rc_dimer_local_frame(q, v, r, cond_type)
+        else:
+            r_next, c = construct_rc_dimer_global_frame(q, v, r, cond_type)
 
     elif system_type =="bistable":
 
@@ -284,9 +288,6 @@ def build_conditioning_and_scalers(
             # Note: q_eff, v_eff, r_eff have shape [n_traj, T-step, 3].
             # We now treat them as our "new trajectories" with one logical step per coarse interval.
             r_next, c = construct_rc_bistable(q_eff, v_eff, r_eff, cond_type)
-
-    #plot_binned_mean_var(r_next[..., 3:6]-r_next[..., :3], dx, "r_rel_local", nbins=40)
-    #plot_binned_mean_var(r_next[..., :3]+r_next[..., 3:6], dx, "r_com_local", nbins=40)
             
     # ---------- FLATTEN + SCALERS (COMMON) ----------
     print(r_next.shape, c.shape)
@@ -302,16 +303,33 @@ def split_particles(x):
     # x1: particle 1, x2: particle 2
     return x[:, 0::2, :], x[:, 1::2, :]
 
-def construct_rc_dimer(q, v, r, cond_type):
+def construct_rc_dimer_global_frame(q, v, r, cond_type):
     """
-    Construct r_next and c for the dimer system, based on the specified conditioning type.
+    Construct r_next and c for the dimer system in the global frame, based on the specified conditioning type.
     """
 
     q1, q2 = split_particles(q)
     v1, v2 = split_particles(v)
     r1, r2 = split_particles(r)
 
-    if cond_type == "pipimdqidpiririm":
+    if cond_type == "pipimririm":
+        r1_next = r1[:, 2:, :]
+        r2_next = r2[:, 2:, :]
+        r_next  = torch.cat([r1_next, r2_next], dim=-1)  # [..., 6]
+
+        v1_n = v1[:, 1:-1, :]
+        v2_n = v2[:, 1:-1, :]
+        r1_n = r1[:, 1:-1, :]
+        r2_n = r2[:, 1:-1, :]
+        
+        v1_prev = v1[:, :-2, :]
+        v2_prev = v2[:, :-2, :]
+        r1_prev = r1[:, :-2, :]
+        r2_prev = r2[:, :-2, :]
+
+        c = torch.cat([v1_n, v2_n, v1_prev, v2_prev, r1_n, r2_n, r1_prev, r2_prev], dim=-1)
+
+    elif cond_type == "pipimdqidpiririm":
         r1_next = r1[:, 2:, :]
         r2_next = r2[:, 2:, :]
         r_next  = torch.cat([r1_next, r2_next], dim=-1)  # [..., 6]
@@ -335,7 +353,26 @@ def construct_rc_dimer(q, v, r, cond_type):
         
         c = torch.cat([delta_x, delta_vx, v1_n, v2_n, v1_prev, v2_prev, r1_n, r2_n, r1_prev, r2_prev], dim=-1)
 
-    elif cond_type == "local_pipimririm":
+    else:
+        raise ValueError(
+            f"Unknown conditioning type: {cond_type} for 'dimer'. "
+        )
+
+    return r_next, c
+
+
+def construct_rc_dimer_local_frame(q, v, r, cond_type):
+    """
+    Construct r_next and c for the dimer system in the local frame, based on the specified conditioning type.
+    """
+
+    assert cond_type.startswith("local_")
+
+    q1, q2 = split_particles(q)
+    v1, v2 = split_particles(v)
+    r1, r2 = split_particles(r)
+
+    if cond_type == "local_pipimririm":
         r1_next = r1[:, 2:, :]
         r2_next = r2[:, 2:, :]
         r_next  = torch.cat([r1_next, r2_next], dim=-1)  # [..., 6]
@@ -414,6 +451,42 @@ def construct_rc_dimer(q, v, r, cond_type):
         )
         
         c = torch.cat([delta_x, delta_vx, v1_n, v2_n, v1_prev, v2_prev, r1_n, r2_n, r1_prev, r2_prev], dim=-1)
+
+        R_n, dx = build_local_frame(q1_n, q2_n)
+        
+        r_next = to_local(R_n, r_next)
+        c = torch.cat((delta_x, delta_vx, to_local(R_n, c[..., 2:])), dim=-1)
+
+    elif cond_type == "local_dqidpipimmrimm":
+        r1_next = r1[:, 3:, :]
+        r2_next = r2[:, 3:, :]
+        r_next  = torch.cat([r1_next, r2_next], dim=-1)  # [..., 6]
+
+        q1_n = q1[:, 2:-1, :]
+        q2_n = q2[:, 2:-1, :]
+        v1_n = v1[:, 2:-1, :]
+        v2_n = v2[:, 2:-1, :]
+        r1_n = r1[:, 2:-1, :]
+        r2_n = r2[:, 2:-1, :]
+        
+        v1_np1 = v1[:, 1:-2, :]
+        v2_np1 = v2[:, 1:-2, :]
+        r1_np1 = r1[:, 1:-2, :]
+        r2_np1 = r2[:, 1:-2, :]
+
+        v1_np2 = v1[:, :-3, :]
+        v2_np2 = v2[:, :-3, :]
+        r1_np2 = r1[:, :-3, :]
+        r2_np2 = r2[:, :-3, :]
+        
+        
+        delta_x, delta_vx = compute_dx_dvx(
+            q1_n, q2_n, v1_n, v2_n, boundary_type='periodic', boxsize=5.0, keepdim=True
+        )
+        
+        c = torch.cat([delta_x, delta_vx, 
+                        v1_n, v2_n, v1_np1, v2_np1, v1_np2, v2_np2, 
+                        r1_n, r2_n, r1_np1, r2_np1, r1_np2, r2_np2], dim=-1)
 
         R_n, dx = build_local_frame(q1_n, q2_n)
         
@@ -505,7 +578,7 @@ def construct_rc_dimer(q, v, r, cond_type):
 
     else:
         raise ValueError(
-            f"Unknown conditioning type: {cond_type} for 'dimer'. "
+            f"Unknown conditioning type: {cond_type} for 'dimer' in Local Frame. "
         )
 
     return r_next, c
@@ -657,16 +730,8 @@ def make_train_val_ds(r_next_norm, c_norm, weights, n_timesteps, n_datasets, L, 
     if systemType == "dimer":
         # full time length per trajectory in the *original* dataset divided by 2
         T_full = n_timesteps
-        
-        # effective number of r_{n+1} steps per trajectory (before stride)
-        if conditionedOn in ('piri'):
-            T_eff = T_full - 1    # r_{n+1} exists for n = 0..T_full-2
-        elif conditionedOn in ("pipimdqidpiririm",
-                                "local_pipimririm", "local_dqipipimririm", "local_dqidpipipimririm", 
-                                "inv_pipimririm", "E3_base"):
-            T_eff = T_full - 2         # you lose an extra step for r_{n-1}
-        else:
-            raise ValueError(f"Unknown conditioning: {conditionedOn}")
+        T_eff = T_full - get_nlags(cond_type)
+
     else:
         raise ValueError('only dimer system')
 
@@ -695,7 +760,18 @@ def make_train_val_ds(r_next_norm, c_norm, weights, n_timesteps, n_datasets, L, 
     
     return train_ds, val_ds
 
+def get_nlags(cond_type):
+    """ Return the number of previous timesteps included in a given conditioning type."""
 
+    if cond_type == "piri":
+        return 1
+    elif cond_type in ("pipimririm", "pipimdqiririm", 
+                    "local_pipimririm", "local_dqipipimririm", "local_dqidpipipimririm"):
+        return 2
+    elif cond_type in ("pimmrimm", "local_dqidpipimmrimm"):
+        return 3
+    else:
+        raise ValueError(f'Undefined conditioning. Set the correct lag number for {cond_type}')
 
 # Not used for now (will clean up later)
 

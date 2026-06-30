@@ -19,13 +19,13 @@ def isotropic_vector_nll(y, mu, log_sigma):
 
     return nll.squeeze(-1)
 
-def standard_gaussian_kl(z_mu, z_logvar):
-    return -0.5 * torch.sum(
-        1.0 + z_logvar - z_mu.pow(2) - z_logvar.exp(),
-        dim=-1,
-    )
+def standard_gaussian_kl(z_mu, z_logvar, free_bits=0.0):
+    kl_per_dim = -0.5 * (1.0 + z_logvar - z_mu.pow(2) - z_logvar.exp())
+    if free_bits > 0.0:
+        kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
+    return kl_per_dim.sum(dim=-1)
 
-def e3_cvae_axial_loss(outputs, batch, beta=1.0):
+def e3_cvae_axial_loss(outputs, batch, beta=1.0, free_bits=0.0):
     """
     Graph-level E3 CVAE loss using the axial vector Gaussian decoder.
 
@@ -62,7 +62,35 @@ def e3_cvae_axial_loss(outputs, batch, beta=1.0):
         log_sigma[:, 1:2],
     )
     nll_graph = nll_node.reshape(B, 2).sum(dim=-1)  # [B], two 3D beads per graph
-    kl_graph = standard_gaussian_kl(outputs["z_mu"], outputs["z_logvar"])
+    kl_graph = standard_gaussian_kl(outputs["z_mu"], outputs["z_logvar"], free_bits=free_bits)
+
+    nll = nll_graph.mean()
+    kl = kl_graph.mean()
+    loss = nll + beta * kl
+    return loss, nll, kl
+
+
+def e3_cvae_isotropic_loss(outputs, batch, beta=1.0, free_bits=0.0):
+    """
+    Graph-level E3 CVAE loss with isotropic Gaussian decoder (one sigma per node).
+
+    outputs:
+        "mu":         [B*2, 3]
+        "log_sigma":  [B*2, 1]
+        "z_mu":       [B, zdim]
+        "z_logvar":   [B, zdim]
+    batch:
+        "r_next":     [B*2, 3]
+        "num_graphs": int
+    """
+    mu = outputs["mu"]
+    log_sigma = outputs["log_sigma"]
+    y = batch["r_next"]
+    B = batch["num_graphs"]
+
+    nll_node = isotropic_vector_nll(y, mu, log_sigma)
+    nll_graph = nll_node.reshape(B, 2).sum(dim=-1)
+    kl_graph = standard_gaussian_kl(outputs["z_mu"], outputs["z_logvar"], free_bits=free_bits)
 
     nll = nll_graph.mean()
     kl = kl_graph.mean()

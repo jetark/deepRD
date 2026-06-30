@@ -89,7 +89,8 @@ class CVAE_LF(CVAESampler):
             "dimer": {
                 "local_pipimririm": 24,
                 "local_dqipipimririm": 25,
-                "local_dqidpipipimririm": 26
+                "local_dqidpipipimririm": 26,
+                "local_dqidpipimmrimm": 38
             },
         }
 
@@ -232,7 +233,7 @@ class CVAE_LF(CVAESampler):
             c_loc_t = torch.cat((dq, to_local(R, c_t[..., 1:])), dim=-1)
             # Optional but very useful sanity check
 
-        elif self.cond_type=='local_dqidpipipimririm':
+        elif self.cond_type in ('local_dqidpipipimririm', 'local_dqidpipimmrimm'):
             # first coordinate "after"
             dq = c_t[..., 0:1]
             dp = c_t[..., 1:2]

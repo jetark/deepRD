@@ -14,7 +14,7 @@ import deepRD.tools.trajectoryTools as trajectoryTools
 from deepRD.diffusionIntegrators import langevinNoiseSamplerDimerGlobal
 from deepRD.noiseSampler.cvae.config import build_model_from_config_e3, load_config
 from deepRD.noiseSampler.cvae.datasets import extract_vars, load_datasets
-from deepRD.noiseSampler.e3cvae.losses import e3_cvae_axial_loss
+from deepRD.noiseSampler.e3cvae.losses import e3_cvae_axial_loss, e3_cvae_isotropic_loss
 from deepRD.noiseSampler.e3cvae.normalization import E3VectorNormalizer
 from deepRD.noiseSampler.e3cvae.tools import (
     DimerE3Dataset,
@@ -314,12 +314,59 @@ def load_benchmark_reference(dataset_dir: str, n_ref: int, n_total: int):
     return bench_X, bench_V
 
 
-class FixedAux3Integrator(langevinNoiseSamplerDimerGlobal):
+class Lag2IntegratorGlobal(langevinNoiseSamplerDimerGlobal):
+    """
+    Extends the global dimer integrator to track two steps of r and v history
+    in aux4 (r_nm2) and aux5 (v_nm2) for lag-2 E3 conditioning.
+
+    Conditioning key: "E3_lag2" — returns 42D vector:
+        q1 q2 v1_n v2_n v1_nm1 v2_nm1 v1_nm2 v2_nm2
+        r1_n r2_n r1_nm1 r2_nm1 r1_nm2 r2_nm2
+    """
+
     def integrateBOBGlobal(self, particleList, dt):
-        v_before = [np.copy(p.nextVelocity) for p in particleList]
-        super().integrateBOBGlobal(particleList, dt)
-        for idx, particle in enumerate(particleList):
-            particle.aux3 = v_before[idx]
+        # Full loop override so aux4/aux5 shift happens AFTER getConditionedVars
+        # reads them (as v_nm2 / r_nm2) but BEFORE aux3/aux2 are updated.
+        for i in range(int(len(particleList) // 2)):
+            p1 = particleList[2 * i]
+            p2 = particleList[2 * i + 1]
+            exp1 = np.exp(-dt * self.Gamma / p1.mass)
+            exp2 = np.exp(-dt * self.Gamma / p2.mass)
+            ff1 = p1.nextVelocity * exp1 + (1 + exp1) * self.forceField[2 * i] * dt / (2 * p1.mass)
+            ff2 = p2.nextVelocity * exp2 + (1 + exp2) * self.forceField[2 * i + 1] * dt / (2 * p2.mass)
+            # getConditionedVars reads aux3 (v_nm1), aux5 (v_nm2), aux2 (r_nm1), aux4 (r_nm2)
+            conditioned_vars = self.getConditionedVars(p1, p2, 0)
+            noise = self.noiseSampler.sample(conditioned_vars)
+            n1, n2 = noise[0:3], noise[3:6]
+            self.rel1 = self.relDistance
+            self.axv1 = self.axisRelVelocity
+            # Shift lag-2 history AFTER reading, BEFORE updating lag-1
+            p1.aux5 = 1.0 * p1.aux3
+            p2.aux5 = 1.0 * p2.aux3
+            p1.aux4 = 1.0 * p1.aux2
+            p2.aux4 = 1.0 * p2.aux2
+            # Update lag-1 history
+            p1.aux2 = 1.0 * p1.aux1
+            p2.aux2 = 1.0 * p2.aux1
+            p1.aux1 = n1
+            p2.aux1 = n2
+            p1.aux3 = 1.0 * p1.nextVelocity
+            p2.aux3 = 1.0 * p2.nextVelocity
+            p1.nextVelocity = ff1 + n1
+            p2.nextVelocity = ff2 + n2
+
+    def getConditionedVars(self, particle1, particle2, index):
+        if self.conditionedOn == "E3_lag2":
+            return np.concatenate((
+                particle1.nextPosition, particle2.nextPosition,
+                particle1.nextVelocity, particle2.nextVelocity,
+                particle1.aux3, particle2.aux3,    # v_nm1
+                particle1.aux5, particle2.aux5,    # v_nm2
+                particle1.aux1, particle2.aux1,    # r_n
+                particle1.aux2, particle2.aux2,    # r_nm1
+                particle1.aux4, particle2.aux4,    # r_nm2
+            ))
+        return super().getConditionedVars(particle1, particle2, index)
 
 
 class E3DimerRolloutSampler:
@@ -330,11 +377,13 @@ class E3DimerRolloutSampler:
         q1 q2 v1_n v2_n v1_nm1 v2_nm1 r1_n r2_n r1_nm1 r2_nm1
     """
 
-    def __init__(self, model, normalizer: E3VectorNormalizer, boxsize: float, device: torch.device):
+    def __init__(self, model, normalizer: E3VectorNormalizer, boxsize: float, device: torch.device, Tr: float = 1.0, Tz: float = 1.0):
         self.model = model
         self.normalizer = normalizer
         self.boxsize = boxsize
         self.device = device
+        self.Tr = Tr
+        self.Tz = Tz
 
     @torch.no_grad()
     def sample(self, conditioned_vars):
@@ -372,18 +421,86 @@ class E3DimerRolloutSampler:
             boxsize=self.boxsize,
         )
         batch = move_graph_batch_to_device(batch, self.device)
-        r_norm, _, _ = self.model.sample_torch(batch)
+        r_norm, _, _ = self.model.sample_torch(batch, Tr=self.Tr, Tz=self.Tz)
         r_phys = self.normalizer.inverse_transform_aux(r_norm).reshape(2, 3)
         return r_phys.cpu().numpy().reshape(6)
 
 
-def run_one_rollout(sampler, frame, params, n_steps: int, seed: int):
+class E3Lag2RolloutSampler(E3DimerRolloutSampler):
+    """
+    Adapter from the 42D E3_lag2 integrator conditioning vector to E3DimerCVAE
+    with lag-2 conditioning (v_nm2, r_nm2 included).
+
+    Conditioning layout (42D):
+        q1 q2 v1_n v2_n v1_nm1 v2_nm1 v1_nm2 v2_nm2
+        r1_n r2_n r1_nm1 r2_nm1 r1_nm2 r2_nm2
+    """
+
+    @torch.no_grad()
+    def sample(self, conditioned_vars):
+        c = np.asarray(conditioned_vars, dtype=np.float32).reshape(42)
+        q1, q2 = c[0:3], c[3:6]
+        v1, v2 = c[6:9], c[9:12]
+        v1p, v2p = c[12:15], c[15:18]
+        v1pp, v2pp = c[18:21], c[21:24]
+        r1, r2 = c[24:27], c[27:30]
+        r1p, r2p = c[30:33], c[33:36]
+        r1pp, r2pp = c[36:39], c[39:42]
+
+        structured = {
+            "q1": torch.tensor(q1, dtype=torch.float32)[None, :],
+            "q2": torch.tensor(q2, dtype=torch.float32)[None, :],
+            "v1_n": torch.tensor(v1, dtype=torch.float32)[None, :],
+            "v2_n": torch.tensor(v2, dtype=torch.float32)[None, :],
+            "v1_nm1": torch.tensor(v1p, dtype=torch.float32)[None, :],
+            "v2_nm1": torch.tensor(v2p, dtype=torch.float32)[None, :],
+            "v1_nm2": torch.tensor(v1pp, dtype=torch.float32)[None, :],
+            "v2_nm2": torch.tensor(v2pp, dtype=torch.float32)[None, :],
+            "r1_n": torch.tensor(r1, dtype=torch.float32)[None, :],
+            "r2_n": torch.tensor(r2, dtype=torch.float32)[None, :],
+            "r1_nm1": torch.tensor(r1p, dtype=torch.float32)[None, :],
+            "r2_nm1": torch.tensor(r2p, dtype=torch.float32)[None, :],
+            "r1_nm2": torch.tensor(r1pp, dtype=torch.float32)[None, :],
+            "r2_nm2": torch.tensor(r2pp, dtype=torch.float32)[None, :],
+        }
+        structured = self.normalizer.transform(structured)
+        batch = build_dimer_graph_batch(
+            q1=structured["q1"],
+            q2=structured["q2"],
+            v1=structured["v1_n"],
+            v2=structured["v2_n"],
+            r1=structured["r1_n"],
+            r2=structured["r2_n"],
+            v1_prev=structured["v1_nm1"],
+            v2_prev=structured["v2_nm1"],
+            r1_prev=structured["r1_nm1"],
+            r2_prev=structured["r2_nm1"],
+            boxsize=self.boxsize,
+            v1_prev2=structured["v1_nm2"],
+            v2_prev2=structured["v2_nm2"],
+            r1_prev2=structured["r1_nm2"],
+            r2_prev2=structured["r2_nm2"],
+        )
+        batch = move_graph_batch_to_device(batch, self.device)
+        r_norm, _, _ = self.model.sample_torch(batch, Tr=self.Tr, Tz=self.Tz)
+        r_phys = self.normalizer.inverse_transform_aux(r_norm).reshape(2, 3)
+        return r_phys.cpu().numpy().reshape(6)
+
+
+def run_one_rollout(sampler, frame, params, n_steps: int, seed: int, lag2: bool = False):
     set_seed(seed)
     p1 = deepRD.particle(frame["q1"].copy(), velocity=frame["v1"].copy(), mass=params["mass"])
     p2 = deepRD.particle(frame["q2"].copy(), velocity=frame["v2"].copy(), mass=params["mass"])
     plist = deepRD.particleList([p1, p2])
 
-    integrator = FixedAux3Integrator(
+    if lag2:
+        integrator_cls = Lag2IntegratorGlobal
+        conditioned_on = "E3_lag2"
+    else:
+        integrator_cls = langevinNoiseSamplerDimerGlobal
+        conditioned_on = "E3_base"
+
+    integrator = integrator_cls(
         params["dt"],
         1,
         n_steps * params["dt"],
@@ -393,7 +510,7 @@ def run_one_rollout(sampler, frame, params, n_steps: int, seed: int):
         params["boxsize"],
         params["boundaryType"],
         0,
-        "E3_base",
+        conditioned_on,
     )
     integrator.setPairPotential(pairBistableBias(0.5, 0.5, 2))
     integrator.prepareSimulation(plist)
@@ -404,6 +521,12 @@ def run_one_rollout(sampler, frame, params, n_steps: int, seed: int):
     p2.aux2 = frame["r2p"].copy()
     p1.aux3 = frame["v1p"].copy()
     p2.aux3 = frame["v2p"].copy()
+    if lag2:
+        # Bootstrap lag-2 history from lag-1 (best available at init)
+        p1.aux4 = frame["r1p"].copy()
+        p2.aux4 = frame["r2p"].copy()
+        p1.aux5 = frame["v1p"].copy()
+        p2.aux5 = frame["v2p"].copy()
     integrator.calculateForceField(plist)
 
     X = [plist.positions.copy()]
@@ -417,7 +540,9 @@ def run_one_rollout(sampler, frame, params, n_steps: int, seed: int):
 
 def rollout_diagnostics(model, normalizer, config, device, n_sims: int, n_steps: int, max_lag: int):
     params = analysisTools.readParameters(str(Path(config.data.dataset_dir) / "parameters"))
-    sampler = E3DimerRolloutSampler(model, normalizer, config.system.boxsize, device)
+    lag2 = getattr(model, "lag2", False)
+    sampler_cls = E3Lag2RolloutSampler if lag2 else E3DimerRolloutSampler
+    sampler = sampler_cls(model, normalizer, config.system.boxsize, device)
     frames = extract_equilibrium_frames(
         config.data.dataset_dir,
         n_frames=n_sims,
@@ -435,7 +560,7 @@ def rollout_diagnostics(model, normalizer, config, device, n_sims: int, n_steps:
     failures = []
     for idx in range(n_sims):
         try:
-            X, V = run_one_rollout(sampler, frames[idx % len(frames)], params, n_steps, seed=1000 + idx)
+            X, V = run_one_rollout(sampler, frames[idx % len(frames)], params, n_steps, seed=1000 + idx, lag2=lag2)
             X_list.append(X)
             V_list.append(V)
         except Exception as exc:

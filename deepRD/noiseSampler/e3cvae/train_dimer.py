@@ -1,6 +1,8 @@
 import argparse
 import json
 import random
+import subprocess
+import sys
 from functools import partial
 from pathlib import Path
 
@@ -31,10 +33,13 @@ from deepRD.noiseSampler.e3cvae.tools import (
 )
 from deepRD.noiseSampler.e3cvae.training import move_graph_batch_to_device, train_e3_cvae
 
+DEFAULT_ROLLOUT_OUTPUT_ROOT = "/group/ag_cmb/scratch/maojrs/stochasticClosure/dimerGlobal/boxsize5"
+_BENCHMARK_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "stochasticClosureCVAE" / "benchmarkReducedDimerE3Gen.py"
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train E3DimerCVAE on dimer dqpipimririm data.")
-    parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--data-dir", default="/group/ag_cmb/scratch/maojrs/stochasticClosure/dimer/boxsize5/benchmark/")
     parser.add_argument("--output-dir", default="deepRD/noiseSampler/training/results/e3_dimer")
     parser.add_argument("--n-trajectories", type=int, default=200)
     parser.add_argument("--n-total", type=int, default=2500)
@@ -42,7 +47,7 @@ def parse_args():
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--zdim", type=int, default=3)
     parser.add_argument("--hidden-irreps", default="32x0e + 16x1o + 8x2e")
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--beta-max", type=float, default=1.0)
@@ -56,6 +61,21 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--free-bits", type=float, default=0.0, help="Free bits for KL per latent dim.")
+    parser.add_argument("--isotropic-loss", action="store_true", help="Use isotropic Gaussian decoder instead of axial.")
+    parser.add_argument("--lag2", action="store_true", help="Condition on two steps of history (v_nm2, r_nm2).")
+    # Post-training rollout
+    parser.add_argument("--rollout", action="store_true", help="Run benchmark rollout script automatically after training.")
+    parser.add_argument("--rollout-script", default=None, help="Path to benchmarkReducedDimerE3Gen.py (auto-detected if omitted).")
+    parser.add_argument("--rollout-output-root", default=DEFAULT_ROLLOUT_OUTPUT_ROOT)
+    parser.add_argument("--rollout-output-name", default=None, help="Subfolder name under rollout-output-root (default: <output-dir-basename>_rollout).")
+    parser.add_argument("--rollout-num-sims", type=int, default=100)
+    parser.add_argument("--rollout-tfinal", type=float, default=10000.0)
+    parser.add_argument("--rollout-equilibration", type=int, default=10000)
+    parser.add_argument("--rollout-Tr", type=float, default=1.0)
+    parser.add_argument("--rollout-Tz", type=float, default=1.0)
+    parser.add_argument("--rollout-benchmark-dir", default=None, help="Benchmark dir for rollout parameters (defaults to --data-dir).")
+    parser.add_argument("--rollout-workers", type=int, default=None, help="Number of parallel workers for rollout (default: cpu_count-1).")
     return parser.parse_args()
 
 
@@ -86,6 +106,8 @@ def make_config(args):
             hidden_dims=[],
             hidden_irreps=args.hidden_irreps,
             standard_prior=True,
+            isotropic=args.isotropic_loss,
+            lag2=args.lag2,
         ),
         training=TrainingSection(
             batch_size=args.batch_size,
@@ -100,6 +122,7 @@ def make_config(args):
             min_delta=args.min_delta,
             validate_every=args.validate_every,
             num_workers=args.num_workers,
+            free_bits=args.free_bits,
         ),
         paths=PathsSection(
             output_root=args.output_dir,
@@ -129,7 +152,13 @@ def equivariance_diagnostics(model, batch):
     """
     model.eval()
     R = o3.rand_matrix(device=batch["edge_vec"].device)
-    batch_rot = rotate_batch_vectors(batch, R)
+    n_dec_vecs = 6 if model.lag2 else 4
+    n_enc_vecs = 7 if model.lag2 else 5
+    batch_rot = rotate_batch_vectors(
+        batch, R,
+        irreps_dec_base=f"{n_dec_vecs}x1o + {n_dec_vecs}x0e",
+        irreps_enc=f"{n_enc_vecs}x1o + {n_enc_vecs}x0e",
+    )
 
     z = torch.randn(
         batch["num_graphs"],
@@ -183,6 +212,35 @@ def write_json(path, data):
         json.dump(data, f, indent=2, sort_keys=True)
 
 
+def run_rollout(args, output_dir: Path):
+    script = Path(args.rollout_script) if args.rollout_script else _BENCHMARK_SCRIPT
+    if not script.exists():
+        raise FileNotFoundError(f"Rollout script not found: {script}")
+
+    rollout_name = args.rollout_output_name or (output_dir.name + "_rollout")
+    benchmark_dir = args.rollout_benchmark_dir or args.data_dir
+
+    cmd = [
+        sys.executable, str(script),
+        "--run-dir", str(output_dir),
+        "--output-root", args.rollout_output_root,
+        "--output-name", rollout_name,
+        "--benchmark-dir", benchmark_dir,
+        "--num-simulations", str(args.rollout_num_sims),
+        "--tfinal", str(args.rollout_tfinal),
+        "--equilibration-steps", str(args.rollout_equilibration),
+        "--Tr", str(args.rollout_Tr),
+        "--Tz", str(args.rollout_Tz),
+        "--device", "cpu",  # use CPU so multiprocessing can spawn freely
+        "--overwrite",
+    ]
+    if args.rollout_workers is not None:
+        cmd += ["--num-workers", str(args.rollout_workers)]
+    print("\n--- Starting post-training rollout ---")
+    print("Command:", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -200,7 +258,7 @@ def main():
         trajtype="bench",
     )
     q, v, r = extract_vars(raw_dataset)
-    structured = construct_dqpipimririm_tensors(q, v, r)
+    structured = construct_dqpipimririm_tensors(q, v, r, lag2=args.lag2)
     train_structured, val_structured = split_by_trajectory(structured, args.val_fraction)
 
     normalizer = E3VectorNormalizer.fit(train_structured)
@@ -208,8 +266,8 @@ def main():
     train_structured = normalizer.transform(train_structured)
     val_structured = normalizer.transform(val_structured)
 
-    train_ds = DimerE3Dataset(train_structured, flatten=True)
-    val_ds = DimerE3Dataset(val_structured, flatten=True)
+    train_ds = DimerE3Dataset(train_structured, flatten=True, lag2=args.lag2)
+    val_ds = DimerE3Dataset(val_structured, flatten=True, lag2=args.lag2)
 
     collate = partial(collate_dimer_e3_graphs, boxsize=args.boxsize)
 
@@ -250,6 +308,7 @@ def main():
         min_delta=config.training.min_delta,
         validate_every=config.training.validate_every,
         device=args.device,
+        free_bits=args.free_bits,
     )
 
     val_batch = move_graph_batch_to_device(next(iter(val_loader)), args.device)
@@ -276,6 +335,9 @@ def main():
 
     print("Equivariance diagnostics:", eq_diag)
     print(f"Wrote outputs to {output_dir}")
+
+    if args.rollout:
+        run_rollout(args, output_dir)
 
 
 if __name__ == "__main__":

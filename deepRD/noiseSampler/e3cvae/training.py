@@ -3,7 +3,7 @@ import torch
 import torch.optim as optim
 from tqdm import tqdm
 
-from .losses import e3_cvae_axial_loss
+from .losses import e3_cvae_axial_loss, e3_cvae_isotropic_loss
 
 
 def move_graph_batch_to_device(batch, device):
@@ -40,6 +40,7 @@ def train_e3_cvae(
     min_delta=1e-3,
     validate_every=1,
     device="cpu",
+    free_bits=0.0,
 ):
     """
     Train E3DimerCVAE on graph batches.
@@ -84,7 +85,8 @@ def train_e3_cvae(
             optimizer.zero_grad(set_to_none=True)
 
             outputs = model(batch)
-            loss, nll, kl = e3_cvae_axial_loss(outputs, batch, beta=beta)
+            loss_fn = e3_cvae_isotropic_loss if model.isotropic else e3_cvae_axial_loss
+            loss, nll, kl = loss_fn(outputs, batch, beta=beta, free_bits=free_bits)
             loss.backward()
 
             if grad_clip is not None:
@@ -117,7 +119,7 @@ def train_e3_cvae(
         )
 
         if val_loader is not None and epoch % validate_every == 0:
-            val_metrics = evaluate_e3_cvae(model, val_loader, beta=beta, device=device)
+            val_metrics = evaluate_e3_cvae(model, val_loader, beta=beta, device=device, free_bits=free_bits)
             history["val_total"].append(val_metrics["total"])
             history["val_nll"].append(val_metrics["nll"])
             history["val_kl"].append(val_metrics["kl"])
@@ -169,8 +171,11 @@ def train_e3_cvae(
 
 
 @torch.no_grad()
-def evaluate_e3_cvae(model, loader, beta=1.0, device="cpu"):
+def evaluate_e3_cvae(model, loader, beta=1.0, device="cpu", free_bits=0.0):
     model.eval()
+    isotropic = model.isotropic
+    loss_fn = e3_cvae_isotropic_loss if isotropic else e3_cvae_axial_loss
+
     total_loss = total_nll = total_kl = 0.0
     se_sum = 0.0
     y2_sum = 0.0
@@ -181,15 +186,15 @@ def evaluate_e3_cvae(model, loader, beta=1.0, device="cpu"):
     z_count = 0
     z_mu2_sum = 0.0
     z_logvar_sum = 0.0
-    log_sigma_para_sum = 0.0
-    log_sigma_perp_sum = 0.0
-    sigma_para_sum = 0.0
-    sigma_perp_sum = 0.0
+    log_sigma_col0_sum = 0.0
+    log_sigma_col1_sum = 0.0
+    sigma_col0_sum = 0.0
+    sigma_col1_sum = 0.0
 
     for batch in loader:
         batch = move_graph_batch_to_device(batch, device)
         outputs = model(batch)
-        loss, nll, kl = e3_cvae_axial_loss(outputs, batch, beta=beta)
+        loss, nll, kl = loss_fn(outputs, batch, beta=beta, free_bits=free_bits)
         total_loss += loss.item()
         total_nll += nll.item()
         total_kl += kl.item()
@@ -205,13 +210,12 @@ def evaluate_e3_cvae(model, loader, beta=1.0, device="cpu"):
         sample2_sum += sample.pow(2).sum().item()
         vector_count += y.numel()
 
-        log_sigma_para = log_sigma[:, 0]
-        log_sigma_perp = log_sigma[:, 1]
         node_count += log_sigma.shape[0]
-        log_sigma_para_sum += log_sigma_para.sum().item()
-        log_sigma_perp_sum += log_sigma_perp.sum().item()
-        sigma_para_sum += torch.exp(log_sigma_para).sum().item()
-        sigma_perp_sum += torch.exp(log_sigma_perp).sum().item()
+        log_sigma_col0_sum += log_sigma[:, 0].sum().item()
+        sigma_col0_sum += torch.exp(log_sigma[:, 0]).sum().item()
+        if not isotropic:
+            log_sigma_col1_sum += log_sigma[:, 1].sum().item()
+            sigma_col1_sum += torch.exp(log_sigma[:, 1]).sum().item()
 
         z_mu = outputs["z_mu"]
         z_logvar = outputs["z_logvar"]
@@ -220,7 +224,7 @@ def evaluate_e3_cvae(model, loader, beta=1.0, device="cpu"):
         z_logvar_sum += z_logvar.sum().item()
 
     n_batches = len(loader)
-    return {
+    metrics = {
         "total": total_loss / n_batches,
         "nll": total_nll / n_batches,
         "kl": total_kl / n_batches,
@@ -228,10 +232,18 @@ def evaluate_e3_cvae(model, loader, beta=1.0, device="cpu"):
         "target_rms": (y2_sum / max(vector_count, 1)) ** 0.5,
         "mu_rms": (mu2_sum / max(vector_count, 1)) ** 0.5,
         "sample_rms": (sample2_sum / max(vector_count, 1)) ** 0.5,
-        "log_sigma_para_mean": log_sigma_para_sum / max(node_count, 1),
-        "log_sigma_perp_mean": log_sigma_perp_sum / max(node_count, 1),
-        "sigma_para_mean": sigma_para_sum / max(node_count, 1),
-        "sigma_perp_mean": sigma_perp_sum / max(node_count, 1),
         "z_mu_rms": (z_mu2_sum / max(z_count, 1)) ** 0.5,
         "z_logvar_mean": z_logvar_sum / max(z_count, 1),
     }
+    if isotropic:
+        metrics["log_sigma_mean"] = log_sigma_col0_sum / max(node_count, 1)
+        metrics["sigma_mean"] = sigma_col0_sum / max(node_count, 1)
+        # Keep para/perp keys with same value for backward compat with logging
+        metrics["log_sigma_para_mean"] = metrics["log_sigma_mean"]
+        metrics["log_sigma_perp_mean"] = metrics["log_sigma_mean"]
+    else:
+        metrics["log_sigma_para_mean"] = log_sigma_col0_sum / max(node_count, 1)
+        metrics["log_sigma_perp_mean"] = log_sigma_col1_sum / max(node_count, 1)
+        metrics["sigma_para_mean"] = sigma_col0_sum / max(node_count, 1)
+        metrics["sigma_perp_mean"] = sigma_col1_sum / max(node_count, 1)
+    return metrics

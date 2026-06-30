@@ -21,19 +21,15 @@ def split_dimer_particles(x: torch.Tensor):
     return x[:, 0::2, :], x[:, 1::2, :]
 
 
-def construct_dqpipimririm_tensors(q: torch.Tensor, v: torch.Tensor, r: torch.Tensor):
+def construct_dqpipimririm_tensors(q: torch.Tensor, v: torch.Tensor, r: torch.Tensor, lag2: bool = False):
     """
     Build structured global-frame dqpipimririm tensors from dimer trajectories.
 
-    The effective time index is n=1..T-2 so previous and next auxiliary
-    variables are available.
+    Without lag2: effective time index n=1..T-2, returns T-2 samples per traj.
+    With lag2: effective time index n=2..T-2, returns T-3 samples per traj,
+    adding v1_nm2/v2_nm2 and r1_nm2/r2_nm2 fields.
 
     q, v, r: interleaved dimer tensors [n_traj, 2*T, 3]
-    returns dict of tensors, each [n_traj, T-2, 3]:
-        q1, q2,
-        v1_n, v2_n, v1_nm1, v2_nm1,
-        r1_n, r2_n, r1_nm1, r2_nm1,
-        r1_next, r2_next.
     """
     if q.shape != v.shape or q.shape != r.shape:
         raise ValueError(f"q, v, r must have matching shapes; got {q.shape}, {v.shape}, {r.shape}")
@@ -46,6 +42,26 @@ def construct_dqpipimririm_tensors(q: torch.Tensor, v: torch.Tensor, r: torch.Te
     v1, v2 = split_dimer_particles(v)
     r1, r2 = split_dimer_particles(r)
 
+    if lag2:
+        # n=2..T-2; need n-2 so earliest index is 0
+        return {
+            "q1": q1[:, 2:-1, :],
+            "q2": q2[:, 2:-1, :],
+            "v1_n": v1[:, 2:-1, :],
+            "v2_n": v2[:, 2:-1, :],
+            "v1_nm1": v1[:, 1:-2, :],
+            "v2_nm1": v2[:, 1:-2, :],
+            "v1_nm2": v1[:, :-3, :],
+            "v2_nm2": v2[:, :-3, :],
+            "r1_n": r1[:, 2:-1, :],
+            "r2_n": r2[:, 2:-1, :],
+            "r1_nm1": r1[:, 1:-2, :],
+            "r2_nm1": r2[:, 1:-2, :],
+            "r1_nm2": r1[:, :-3, :],
+            "r2_nm2": r2[:, :-3, :],
+            "r1_next": r1[:, 3:, :],
+            "r2_next": r2[:, 3:, :],
+        }
     return {
         "q1": q1[:, 1:-1, :],
         "q2": q2[:, 1:-1, :],
@@ -69,31 +85,29 @@ def flatten_structured_dqpipimririm(data: dict):
     return {key: value.reshape(-1, value.shape[-1]) for key, value in data.items()}
 
 
+_BASE_KEYS = (
+    "q1", "q2",
+    "v1_n", "v2_n", "v1_nm1", "v2_nm1",
+    "r1_n", "r2_n", "r1_nm1", "r2_nm1",
+    "r1_next", "r2_next",
+)
+_LAG2_EXTRA_KEYS = ("v1_nm2", "v2_nm2", "r1_nm2", "r2_nm2")
+
+
 class DimerE3Dataset(Dataset):
     """
     Dataset for global-frame dqpipimririm E3 graph training.
 
     Items are raw vector fields for one dimer sample. Use
     collate_dimer_e3_graphs as the DataLoader collate_fn to build graph batches.
+    Pass lag2=True to include the two-step history fields v*_nm2 and r*_nm2.
     """
-    keys = (
-        "q1",
-        "q2",
-        "v1_n",
-        "v2_n",
-        "v1_nm1",
-        "v2_nm1",
-        "r1_n",
-        "r2_n",
-        "r1_nm1",
-        "r2_nm1",
-        "r1_next",
-        "r2_next",
-    )
 
-    def __init__(self, structured: dict, flatten=True):
+    def __init__(self, structured: dict, flatten=True, lag2: bool = False):
         if flatten:
             structured = flatten_structured_dqpipimririm(structured)
+        self.lag2 = lag2
+        self.keys = _BASE_KEYS + (_LAG2_EXTRA_KEYS if lag2 else ())
         missing = [key for key in self.keys if key not in structured]
         if missing:
             raise ValueError(f"Missing structured dqpipimririm fields: {missing}")
@@ -114,11 +128,14 @@ class DimerE3Dataset(Dataset):
 def collate_dimer_e3_graphs(samples, boxsize=5.0):
     """
     Collate DimerE3Dataset items into one E3 graph batch.
+    Automatically detects lag2 mode from the presence of v1_nm2 in the samples.
     """
+    all_keys = samples[0].keys()
     batch = {
         key: torch.stack([sample[key] for sample in samples], dim=0)
-        for key in DimerE3Dataset.keys
+        for key in all_keys
     }
+    lag2 = "v1_nm2" in batch
     return build_dimer_graph_batch(
         q1=batch["q1"],
         q2=batch["q2"],
@@ -133,6 +150,10 @@ def collate_dimer_e3_graphs(samples, boxsize=5.0):
         r1_next=batch["r1_next"],
         r2_next=batch["r2_next"],
         boxsize=boxsize,
+        v1_prev2=batch.get("v1_nm2"),
+        v2_prev2=batch.get("v2_nm2"),
+        r1_prev2=batch.get("r1_nm2"),
+        r2_prev2=batch.get("r2_nm2"),
     )
 
 def pack_e3_features(scalars, vectors):
@@ -160,46 +181,45 @@ def build_dimer_graph_batch(
     r1_next=None,
     r2_next=None,
     boxsize=5.0,
+    v1_prev2=None,
+    v2_prev2=None,
+    r1_prev2=None,
+    r2_prev2=None,
 ):
     """
     Shapes:
         q1, q2, v1, ...: [B, 3]
     Returns graph tensors for B two-node graphs.
+    Pass v*_prev2 and r*_prev2 to enable lag-2 conditioning.
     """
 
     B = q1.shape[0]
     device = q1.device
+    lag2 = v1_prev2 is not None
 
-    # Node-wise vectors: [B, 2, num_vecs, 3]
-    vec_dec = torch.stack([
+    # Base: 4 per-node vectors (v_n, v_nm1, r_n, r_nm1); lag2 adds v_nm2 and r_nm2
+    dec_vecs = [
         torch.stack([v1, v2], dim=1),
         torch.stack([v1_prev, v2_prev], dim=1),
         torch.stack([r1, r2], dim=1),
         torch.stack([r1_prev, r2_prev], dim=1),
-    ], dim=2)
+    ]
+    if lag2:
+        dec_vecs += [
+            torch.stack([v1_prev2, v2_prev2], dim=1),
+            torch.stack([r1_prev2, r2_prev2], dim=1),
+        ]
 
-    # flatten nodes: [B*2, num_vecs, 3]
-    vec_dec = vec_dec.reshape(B * 2, 4, 3)
+    # Node-wise vectors: [B, 2, num_vecs, 3] → flatten → [B*2, num_vecs, 3]
+    vec_dec = torch.stack(dec_vecs, dim=2).reshape(B * 2, len(dec_vecs), 3)
 
-    # example scalar features
-    scal_dec = torch.cat([
-        vec_dec.norm(dim=-1),  # [B*2, 4]
-    ], dim=-1)
-
+    scal_dec = vec_dec.norm(dim=-1)
     h_dec_base = pack_e3_features(scal_dec, vec_dec)
 
     if r1_next is not None:
         target = torch.stack([r1_next, r2_next], dim=1).reshape(B * 2, 3)
-
-        vec_enc = torch.cat([
-            vec_dec,
-            target[:, None, :],
-        ], dim=1)
-
-        scal_enc = torch.cat([
-            vec_enc.norm(dim=-1),
-        ], dim=-1)
-
+        vec_enc = torch.cat([vec_dec, target[:, None, :]], dim=1)
+        scal_enc = vec_enc.norm(dim=-1)
         h_enc = pack_e3_features(scal_enc, vec_enc)
     else:
         target = None
@@ -274,8 +294,7 @@ def rotate_e3_features(x: torch.Tensor, irreps, R: torch.Tensor) -> torch.Tensor
     output: [N, irreps.dim]
     """
     irreps = o3.Irreps(irreps)
-    R = R.to(device=x.device, dtype=x.dtype)
-    D = irreps.D_from_matrix(R).to(device=x.device, dtype=x.dtype)
+    D = irreps.D_from_matrix(R.cpu()).to(device=x.device, dtype=x.dtype)
     return x @ D.T
 
 

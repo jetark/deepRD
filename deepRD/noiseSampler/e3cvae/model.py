@@ -6,12 +6,14 @@ from .axial_covariance import bond_unit_from_edge_vec, sample_axial_gaussian
 from .tools import append_z_to_decoder_features
 
 class E3DimerCVAE(nn.Module):
-    def __init__(self, zdim, hidden_irreps="32x0e + 16x1o + 8x2e"):
+    def __init__(self, zdim, hidden_irreps="32x0e + 16x1o + 8x2e", isotropic=False, lag2=False):
         super().__init__()
         self.zdim = zdim
         self.hidden_irreps = hidden_irreps
-        self.encoder = E3InvariantEncoder(zdim=zdim, hidden_irreps=hidden_irreps)
-        self.decoder = E3EquivariantDecoder(zdim=zdim, hidden_irreps=hidden_irreps)
+        self.isotropic = isotropic
+        self.lag2 = lag2
+        self.encoder = E3InvariantEncoder(zdim=zdim, hidden_irreps=hidden_irreps, lag2=lag2)
+        self.decoder = E3EquivariantDecoder(zdim=zdim, hidden_irreps=hidden_irreps, isotropic=isotropic, lag2=lag2)
 
     def reparameterize(self, z_mu, z_logvar):
         std = torch.exp(0.5 * z_logvar)
@@ -86,15 +88,19 @@ class E3DimerCVAE(nn.Module):
             edge_radial=batch["edge_radial"],
         )
 
-        bond_unit = batch.get("bond_unit_node")
-        if bond_unit is None:
-            bond_unit = bond_unit_from_edge_vec(batch["edge_vec"], B)
-        r_next = sample_axial_gaussian(
-            mu,
-            bond_unit,
-            log_sigma[:, 0:1],
-            log_sigma[:, 1:2],
-            noise_scale=Tr,
-        )
+        if self.isotropic:
+            eps = torch.randn_like(mu)
+            r_next = mu + torch.exp(log_sigma) * Tr * eps
+        else:
+            bond_unit = batch.get("bond_unit_node")
+            if bond_unit is None:
+                bond_unit = bond_unit_from_edge_vec(batch["edge_vec"], B)
+            r_next = sample_axial_gaussian(
+                mu,
+                bond_unit,
+                log_sigma[:, 0:1],
+                log_sigma[:, 1:2],
+                noise_scale=Tr,
+            )
 
         return r_next, mu, log_sigma
