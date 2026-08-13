@@ -1,3 +1,13 @@
+"""
+LEGACY (not migrated to the config convention). This is the "half" (stride-2
+coarse-grained) bistable variant with cond_type 'pipimririm', which is outside
+the piri/pipimri/piririm scope of the standard reduced-model pipeline. It has
+NOT been ported to the results/<cond>/<NNN>_<name>/ config system used by
+benchmarkReducedBistableCVAEGen.py, and additionally needs 'pipimririm' added to
+the bistable cdim map (deepRD/noiseSampler/cvae/models.py, CVAE.assign_dims)
+plus a coarse-grained CVAE_SP trained with `trainReducedBistableCVAEGen.py
+--step 2` before it can run.
+"""
 import numpy as np
 import random
 import os
@@ -84,7 +94,13 @@ if bsize != boxsize:
     print('Requested boxsize does not match simulation')
 
 # Define noise sampler
-localModelDirectory = 'notebooks/stochasticClosureCVAE/dev/'
+# NOTE: this is the "half" (stride-2 coarse-grained) variant with cond_type
+# 'pipimririm', which is OUTSIDE the current piri/pipimri/piririm bistable scope.
+# It needs a coarse-grained CVAE_SP trained with `trainReducedBistableCVAEGen.py
+# --cond pipimririm --step 2` AND 'pipimririm' added to the bistable cdim map in
+# deepRD/noiseSampler/cvae/models.py (CVAE.assign_dims) before it will run.
+localModelDirectory = os.path.join(
+    os.path.dirname(deepRD.__file__), 'noiseSampler', 'results', 'bistable') + '/'
 systemType='bistable'
 
 # Parameters for external potential (will only acts on distinguished particles (type 1)
@@ -103,7 +119,7 @@ equilibrationSteps = 10000//k
 dt = k*dt
 
 #Model weights and scaler filepath
-model_state_path = localModelDirectory + f"ckpts/cvae_checkpoint_half_{systemType}_{conditionedOn}_stride{k}.pt"
+model_state_path = localModelDirectory + f"ckpts/cvae_sp_half_{systemType}_{conditionedOn}_stride{k}.pt"
 normalizers_path = localModelDirectory + f"normalizers/normalizers_half_{systemType}_{conditionedOn}_stride{k}.pkl"
 #nSampler = cvaeSampler.defaultSamplingModel()
 
@@ -128,7 +144,7 @@ def runParallelSims(simnumber):
     
     # Loading Sampling Model
     zdim = 3
-    nSampler = cvaeSampler.CVAE(zdim=zdim, cond_type=conditionedOn)
+    nSampler = cvaeSampler.CVAE_SP(zdim=zdim, system_type=systemType, cond_type=conditionedOn)
     nSampler.eval()
     ckpt = torch.load(model_state_path, map_location="cpu", weights_only=True)
     nSampler.load_state_dict(ckpt['model_state'])

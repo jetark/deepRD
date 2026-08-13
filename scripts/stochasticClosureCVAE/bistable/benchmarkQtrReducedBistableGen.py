@@ -1,3 +1,11 @@
+"""
+LEGACY (not migrated to the config convention). This is the "qtr" (stride-4
+coarse-grained) bistable variant. It has NOT been ported to the
+results/<cond>/<NNN>_<name>/ config system used by
+benchmarkReducedBistableCVAEGen.py, and needs a coarse-grained CVAE_SP trained
+with `trainReducedBistableCVAEGen.py --step 4` before it can run. Kept for
+reference; outside the stride-1 piri/pipimri/piririm scope.
+"""
 import numpy as np
 import random
 import os
@@ -84,7 +92,12 @@ if bsize != boxsize:
     print('Requested boxsize does not match simulation')
 
 # Define noise sampler
-localModelDirectory = 'notebooks/stochasticClosureCVAE/dev/'
+# NOTE: this is the "qtr" (stride-4 coarse-grained) variant. It needs a
+# coarse-grained CVAE_SP trained with `trainReducedBistableCVAEGen.py --cond
+# <cond> --step 4` before it will run; it is outside the stride-1
+# piri/pipimri/piririm scope of the standard reduced-model pipeline.
+localModelDirectory = os.path.join(
+    os.path.dirname(deepRD.__file__), 'noiseSampler', 'results', 'bistable') + '/'
 systemType='bistable'
 
 # Parameters for external potential (will only acts on distinguished particles (type 1)
@@ -104,7 +117,7 @@ dt = k*dt
 print(dt)
 
 #Model weights and scaler filepath
-model_state_path = localModelDirectory + f"ckpts/cvae_checkpoint_qtr_{systemType}_{conditionedOn}_stride{k}.pt"
+model_state_path = localModelDirectory + f"ckpts/cvae_sp_qtr_{systemType}_{conditionedOn}_stride{k}.pt"
 normalizers_path = localModelDirectory + f"normalizers/normalizers_qtr_{systemType}_{conditionedOn}_stride{k}.pkl"
 #nSampler = cvaeSampler.defaultSamplingModel()
 
@@ -129,7 +142,7 @@ def runParallelSims(simnumber):
     
     # Loading Sampling Model
     zdim = 3
-    nSampler = cvaeSampler.CVAE(zdim=zdim, cond_type=conditionedOn)
+    nSampler = cvaeSampler.CVAE_SP(zdim=zdim, system_type=systemType, cond_type=conditionedOn)
     nSampler.eval()
     ckpt = torch.load(model_state_path, map_location="cpu", weights_only=True)
     nSampler.load_state_dict(ckpt['model_state'])

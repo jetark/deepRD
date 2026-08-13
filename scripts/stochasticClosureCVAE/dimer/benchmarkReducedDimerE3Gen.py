@@ -44,7 +44,7 @@ DEFAULT_RUN_DIR = (
     "deepRD/noiseSampler/training/results/"
     "e3_dimer_dqpipimririm_axial_20260617"
 )
-DEFAULT_OUTPUT_ROOT = "/group/ag_cmb/scratch/maojrs/stochasticClosure/dimerGlobal/boxsize5"
+DEFAULT_OUTPUT_ROOT = "/group/ag_cmb/scratch/maojrs/stochasticClosure/dimerGlobal/boxsize5/cvaeRuns"
 DEFAULT_BENCHMARK_DIR = "/group/ag_cmb/scratch/maojrs/stochasticClosure/dimer/boxsize5/benchmark"
 
 
@@ -59,7 +59,7 @@ def parse_args():
     parser.add_argument("--tfinal", type=float, default=10000.0)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--equilibration-steps", type=int, default=10000)
-    parser.add_argument("--device", default=None, help="Defaults to cuda if visible, else cpu.")
+    parser.add_argument("--device", default='cpu', help="Defaults to cuda if visible, else cpu.")
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--Tr", type=float, default=1.0, help="Decoder vector-noise temperature.")
     parser.add_argument("--Tz", type=float, default=1.0, help="Latent prior temperature.")
@@ -201,13 +201,7 @@ def main():
     basefilename = str(output_dir / "simMoriZwanzigReduced_")
     sim_numbers = list(range(args.start_index, args.start_index + args.num_simulations))
 
-    if args.num_workers is None:
-        if args.serial or device.type == "cuda":
-            num_workers = 1
-        else:
-            num_workers = max(multiprocessing.cpu_count() - 1, 1)
-    else:
-        num_workers = args.num_workers
+    num_workers = args.num_workers if args.num_workers is not None else max(multiprocessing.cpu_count() - 1, 1)
 
     print("Simulation for ri+1|E3_base with E3DimerCVAE begins ...")
     print(f"Output directory: {output_dir}")
