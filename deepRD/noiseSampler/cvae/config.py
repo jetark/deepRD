@@ -43,6 +43,14 @@ class ModelSection:
     hidden_irreps: str | None = None
     isotropic: bool = False
     lag2: bool = False
+    n_dec_layers: int = 2
+    dec_nonlinear_head: bool = False
+    add_dx_scalar: bool = False
+    radial_num_basis: int = 16
+    r_cut: float = 2.0
+    lmax: int = 2
+    add_linear_response_mean: bool = False
+    gate_scale: float = 0.05
 
 
 @dataclass
@@ -62,6 +70,9 @@ class TrainingSection:
     validate_every: int = 1
     weights_for_training: bool = False
     num_workers: int = 0
+    # MDN specific parameters
+    lambda_gate: float | None = None
+    lambda_comp: float | None = None
 
 
 @dataclass
@@ -113,11 +124,13 @@ def build_model_from_config(config: CVAEConfig):
     """Builds the CVAE model based on the provided configuration."""
     
     if config.model.model_type == "CVAE":
-        from deepRD.noiseSampler.cvae.models import CVAE as model_class
+        from deepRD.noiseSampler.cvaeSampler import CVAESampler as model_class
     elif config.model.model_type == "CVAE_LF":
         from deepRD.noiseSampler.cvaeSampler import CVAE_LF as model_class
+    elif config.model.model_type == "CVAE_SP":
+        from deepRD.noiseSampler.cvaeSampler import CVAE_SP as model_class
     elif config.model.model_type == "CVAE_MDN":
-        from deepRD.noiseSampler.cvaeSampler import CVAE_LF as model_class
+        from deepRD.noiseSampler.cvaeSampler import CVAE_MDN as model_class
     elif config.model.model_type == "CVAE_Inv":
         from deepRD.noiseSampler.cvaeSampler import CVAE_Inv as model_class
     elif config.model.model_type == "CVAE_E3":
@@ -163,4 +176,12 @@ def build_model_from_config_e3(config: CVAEConfig):
         hidden_irreps=hidden_irreps,
         isotropic=getattr(config.model, "isotropic", False),
         lag2=getattr(config.model, "lag2", False),
+        n_dec_layers=getattr(config.model, "n_dec_layers", 2),
+        dec_nonlinear_head=getattr(config.model, "dec_nonlinear_head", False),
+        add_dx_scalar=getattr(config.model, "add_dx_scalar", False),
+        radial_num_basis=getattr(config.model, "radial_num_basis", 16),
+        r_cut=getattr(config.model, "r_cut", 2.0),
+        lmax=getattr(config.model, "lmax", 2),
+        add_linear_response_mean=getattr(config.model, "add_linear_response_mean", False),
+        gate_scale=getattr(config.model, "gate_scale", 0.05),
     )

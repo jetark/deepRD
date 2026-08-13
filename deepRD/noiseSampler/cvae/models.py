@@ -48,7 +48,10 @@ class CVAE(nn.Module):
                 "bistable": {
                     "piri": 6,
                     "piririm": 9,
-                    "pipimri": 9
+                    "pipimri": 9,
+                    "ririm": 6,             # velocity-free (E5): r^n, r^{n-1}
+                    "piririmrimm": 12,      # v, r^n, r^{n-1}, r^{n-2}
+                    "piririmrimmriM": 15    # + r^{n-3}
                 },
                 "dimer": {
                     "pidqiri": 13,
@@ -66,7 +69,8 @@ class CVAE(nn.Module):
                     "pimmdqidpirimm": 38,
                     "piMdqidpiriM": 50,
                     "relcom_pipimdqiririm": 25,
-                    "local_dqipipimririm": 25
+                    "local_dqipipimririm": 25,
+                    "local_dqipiririm": 19          # no v^{n-1} (E15)
                 },
             }
 
@@ -174,6 +178,7 @@ class CVAE_LF(nn.Module):
                 "pipimririm": 24,
                 "local_pipimririm": 24,
                 "local_dqipipimririm": 25,
+                "local_dqipiririm": 19,   # no v^{n-1} (E15)
                 "local_dqidpipipimririm": 26,
             },
         }

@@ -53,7 +53,7 @@ def load_datasets(datasetDirectory, n_datasets, n_total, trajtype='bench'):
         "stochasticClosure/boxsize5/benchmark/"
         n_total = 2500
 
-    fileName = "simMoriZwanzigReduced_" if type=='reduced' else "simMoriZwanzig_"
+    fileName = "simMoriZwanzigReduced_" if trajtype=='reduced' else "simMoriZwanzig_"
     
     # Sample simulation files randomly
     fnums = np.sort(np.random.choice(n_total, n_datasets, replace=False))
@@ -162,6 +162,7 @@ class RVSeqDataset(Dataset):
                  r_next_seq: torch.Tensor,
                  c_seq: torch.Tensor,
                  w_seq: torch.Tensor,
+                 y_seq: torch.Tensor | None,
                  L: int,
                  step: int = 1):
         super().__init__()
@@ -184,6 +185,11 @@ class RVSeqDataset(Dataset):
             self.w_seq      = w_seq
         else:
             self.w_seq = torch.ones_like(c_seq[..., :1])
+
+        if y_seq is not None:
+            self.y_seq = y_seq
+        else:
+            self.y_seq = None
 
         self.N_traj, self.T, _ = r_next_seq.shape
         if self.T < L:
@@ -208,7 +214,12 @@ class RVSeqDataset(Dataset):
         r_win = self.r_next_seq[traj_idx, t_start:t_end, :]   # [L, idim]
         c_win = self.c_seq[traj_idx,  t_start:t_end, :]       # [L, cdim]
         w_win = self.w_seq[traj_idx, t_start:t_end, :]
-        return r_win, c_win, w_win
+
+        if self.y_seq is not None:
+            y_win = self.y_seq[traj_idx, t_start:t_end, :]
+            return r_win, c_win, w_win, y_win
+        else:
+            return r_win, c_win, w_win
 
 
 """
@@ -278,17 +289,18 @@ def build_conditioning_and_scalers(
             assert r is not None, "r must be provided for step=1"
             q_eff, v_eff, r_eff = q, v, r
         else:
-            # compute r_cg from fine trajectories, use that as 'r_eff'
-
+            # compute r_cg from fine trajectories, use that as 'r_eff'.
+            # q_eff, v_eff, r_eff have shape [n_traj, T-step, 3]; we treat them
+            # as our "new trajectories" with one logical step per coarse interval.
             q_eff, v_eff, r_eff = compute_r_cg_from_fine(
                 q, v,
                 k=step,
                 parameters=parameters
             )
-            # Note: q_eff, v_eff, r_eff have shape [n_traj, T-step, 3].
-            # We now treat them as our "new trajectories" with one logical step per coarse interval.
-            r_next, c = construct_rc_bistable(q_eff, v_eff, r_eff, cond_type)
-            
+
+        # Build (r_next, c) for both the fine (step==1) and coarse (step>1) grids.
+        r_next, c = construct_rc_bistable(q_eff, v_eff, r_eff, cond_type)
+
     # ---------- FLATTEN + SCALERS (COMMON) ----------
     print(r_next.shape, c.shape)
     r_next_all = r_next.reshape(-1, r_next.shape[-1])
@@ -352,6 +364,29 @@ def construct_rc_dimer_global_frame(q, v, r, cond_type):
         )
         
         c = torch.cat([delta_x, delta_vx, v1_n, v2_n, v1_prev, v2_prev, r1_n, r2_n, r1_prev, r2_prev], dim=-1)
+    elif cond_type == "pipimdqiririm":
+        r1_next = r1[:, 2:, :]
+        r2_next = r2[:, 2:, :]
+        r_next  = torch.cat([r1_next, r2_next], dim=-1)  # [..., 6]
+
+        v1_n = v1[:, 1:-1, :]
+        v2_n = v2[:, 1:-1, :]
+        r1_n = r1[:, 1:-1, :]
+        r2_n = r2[:, 1:-1, :]
+        
+        v1_prev = v1[:, :-2, :]
+        v2_prev = v2[:, :-2, :]
+        r1_prev = r1[:, :-2, :]
+        r2_prev = r2[:, :-2, :]
+        
+        q1_n = q1[:, 1:-1, :]
+        q2_n = q2[:, 1:-1, :]
+        
+        delta_x, delta_vx = compute_dx_dvx(
+            q1_n, q2_n, v1_n, v2_n, boundary_type='periodic', boxsize=5.0, keepdim=True
+        )
+        
+        c = torch.cat([v1_n, v2_n, v1_prev, v2_prev, delta_x, r1_n, r2_n, r1_prev, r2_prev], dim=-1)
 
     else:
         raise ValueError(
@@ -492,6 +527,122 @@ def construct_rc_dimer_local_frame(q, v, r, cond_type):
         
         r_next = to_local(R_n, r_next)
         c = torch.cat((delta_x, delta_vx, to_local(R_n, c[..., 2:])), dim=-1)
+
+    elif cond_type == "local_dqipiri":
+        r1_next = r1[:, 1:, :]
+        r2_next = r2[:, 1:, :]
+        r_next  = torch.cat([r1_next, r2_next], dim=-1)  # [..., 6]
+
+        v1_n = v1[:, :-1, :]
+        v2_n = v2[:, :-1, :]
+        r1_n = r1[:, :-1, :]
+        r2_n = r2[:, :-1, :]
+
+        q1_n = q1[:, :-1, :]
+        q2_n = q2[:, :-1, :]
+
+        delta_x, _ = compute_dx_dvx(
+            q1_n, q2_n, v1_n, v2_n, boundary_type='periodic', boxsize=5.0, keepdim=True
+        )
+
+        c = torch.cat([delta_x, v1_n, v2_n, r1_n, r2_n], dim=-1)
+
+        R_n, dx = build_local_frame(q1_n, q2_n)
+
+        r_next = to_local(R_n, r_next)
+        c = torch.cat((delta_x, to_local(R_n, c[..., 1:])), dim=-1)
+
+    elif cond_type == "local_dqipiririm":
+        # minimal-memory variant of local_dqipipimririm (E15): {dx, v^n, r^n,
+        # r^{n-1}} -> r^{n+1}. Same window, same block ordering, with the
+        # v^{n-1} block dropped -- that omission is the whole experiment, so the
+        # rows must line up with the baseline's row-for-row.
+        r1_next = r1[:, 2:, :]
+        r2_next = r2[:, 2:, :]
+        r_next  = torch.cat([r1_next, r2_next], dim=-1)  # [..., 6]
+
+        v1_n, v2_n = v1[:, 1:-1, :], v2[:, 1:-1, :]
+        r1_n, r2_n = r1[:, 1:-1, :], r2[:, 1:-1, :]
+        r1_prev, r2_prev = r1[:, :-2, :], r2[:, :-2, :]
+
+        q1_n, q2_n = q1[:, 1:-1, :], q2[:, 1:-1, :]
+
+        delta_x, _ = compute_dx_dvx(
+            q1_n, q2_n, v1_n, v2_n, boundary_type='periodic', boxsize=5.0, keepdim=True
+        )
+
+        c = torch.cat([delta_x, v1_n, v2_n, r1_n, r2_n, r1_prev, r2_prev], dim=-1)
+
+        R_n, dx = build_local_frame(q1_n, q2_n)
+
+        r_next = to_local(R_n, r_next)
+        c = torch.cat((delta_x, to_local(R_n, c[..., 1:])), dim=-1)
+
+    elif cond_type == "local_dqiririm":
+        # velocity-free: {dx, r^n, r^{n-1}} -> r^{n+1}.  Two auxiliary lags, so
+        # the usable window starts at n = 1 (needs n-1) and ends at T-2.
+        r1_next = r1[:, 2:, :]
+        r2_next = r2[:, 2:, :]
+        r_next  = torch.cat([r1_next, r2_next], dim=-1)  # [..., 6]
+
+        r1_n, r2_n = r1[:, 1:-1, :], r2[:, 1:-1, :]
+        r1_p, r2_p = r1[:, :-2, :], r2[:, :-2, :]
+
+        q1_n, q2_n = q1[:, 1:-1, :], q2[:, 1:-1, :]
+        v1_n, v2_n = v1[:, 1:-1, :], v2[:, 1:-1, :]
+
+        delta_x, _ = compute_dx_dvx(
+            q1_n, q2_n, v1_n, v2_n, boundary_type='periodic', boxsize=5.0, keepdim=True
+        )
+
+        R_n, dx = build_local_frame(q1_n, q2_n)
+
+        r_next = to_local(R_n, r_next)
+        c = torch.cat((delta_x,
+                       to_local(R_n, torch.cat([r1_n, r2_n, r1_p, r2_p], dim=-1))),
+                      dim=-1)
+
+    elif cond_type == "local_piri":
+        r1_next = r1[:, 1:, :]
+        r2_next = r2[:, 1:, :]
+        r_next  = torch.cat([r1_next, r2_next], dim=-1)  # [..., 6]
+
+        v1_n = v1[:, :-1, :]
+        v2_n = v2[:, :-1, :]
+        r1_n = r1[:, :-1, :]
+        r2_n = r2[:, :-1, :]
+
+        q1_n = q1[:, :-1, :]
+        q2_n = q2[:, :-1, :]
+
+        c = torch.cat([v1_n, v2_n, r1_n, r2_n], dim=-1)
+
+        R_n, dx = build_local_frame(q1_n, q2_n)
+
+        r_next = to_local(R_n, r_next)
+        c = to_local(R_n, c)
+
+    elif cond_type == "local_dqipi":
+        r1_next = r1[:, 1:, :]
+        r2_next = r2[:, 1:, :]
+        r_next  = torch.cat([r1_next, r2_next], dim=-1)  # [..., 6]
+
+        v1_n = v1[:, :-1, :]
+        v2_n = v2[:, :-1, :]
+
+        q1_n = q1[:, :-1, :]
+        q2_n = q2[:, :-1, :]
+
+        delta_x, _ = compute_dx_dvx(
+            q1_n, q2_n, v1_n, v2_n, boundary_type='periodic', boxsize=5.0, keepdim=True
+        )
+
+        c = torch.cat([delta_x, v1_n, v2_n], dim=-1)
+
+        R_n, dx = build_local_frame(q1_n, q2_n)
+
+        r_next = to_local(R_n, r_next)
+        c = torch.cat((delta_x, to_local(R_n, c[..., 1:])), dim=-1)
 
     elif cond_type == "inv_pipimririm":
         r1_next = r1[:, 2:, :]
@@ -666,6 +817,14 @@ def construct_rc_bistable(q_eff, v_eff, r_eff, cond_type):
         r_prev = r_eff[:, :-2, :]      # r_{n-1}
         c = torch.cat([v_n, r_n, r_prev], dim=-1)
 
+    elif cond_type == "ririm":
+        # velocity-free: {r^n, r^{n-1}} -> r^{n+1}.  Same window as piririm,
+        # with v_n dropped -- that omission is the whole experiment (E5).
+        r_next = r_eff[:, 2:, :]       # r_{n+1}
+        r_n    = r_eff[:, 1:-1, :]     # r_n
+        r_prev = r_eff[:, :-2, :]      # r_{n-1}
+        c = torch.cat([r_n, r_prev], dim=-1)
+
     elif cond_type == "piririmrimm":
         # v_n, r_n, r_{n-1}, r_{n-2} -> predict r_{n+1}
         # valid n indices: 2 .. T_eff-2  (so that n+1 exists and n-2 exists)
@@ -677,6 +836,19 @@ def construct_rc_bistable(q_eff, v_eff, r_eff, cond_type):
         r_prev2 = r_eff[:, :-3, :]      # r_{n-2}
 
         c = torch.cat([v_n, r_n, r_prev1, r_prev2], dim=-1)
+
+    elif cond_type == "piririmrimmriM":
+        # v_n, r_n, r_{n-1}, r_{n-2}, r_{n-3} -> predict r_{n+1}
+        # valid n indices: 3 .. T_eff-2  (so that n+1 exists and n-3 exists)
+
+        r_next = r_eff[:, 4:, :]        # r_{n+1}
+        v_n    = v_eff[:, 3:-1, :]      # v_n
+        r_n    = r_eff[:, 3:-1, :]      # r_n
+        r_prev1 = r_eff[:, 2:-2, :]     # r_{n-1}
+        r_prev2 = r_eff[:, 1:-3, :]     # r_{n-2}
+        r_prev3 = r_eff[:, :-4, :]      # r_{n-3}
+
+        c = torch.cat([v_n, r_n, r_prev1, r_prev2, r_prev3], dim=-1)
 
     elif cond_type == "pipimri":
         # n = 1 .. T_eff-2
@@ -703,7 +875,7 @@ def construct_rc_bistable(q_eff, v_eff, r_eff, cond_type):
 
     return r_next, c
 
-def make_train_val_ds(r_next_norm, c_norm, weights, n_timesteps, n_datasets, L, systemType, conditionedOn):
+def make_train_val_ds(r_next_norm, c_norm, weights, y, n_timesteps, n_datasets, L, systemType, conditionedOn):
     """
     Creates training and validation datasets from normalized data.
 
@@ -711,6 +883,7 @@ def make_train_val_ds(r_next_norm, c_norm, weights, n_timesteps, n_datasets, L, 
     r_next_norm (Tensor): Normalized next state samples.
     c_norm (Tensor): Normalized conditioning data.
     weights (Tensor): Weights for the samples.
+    y (Tensor): Target labels for the samples.
     n_datasets (int): Number of datasets to create.
     L (int): Length of sequences for the dataset.
     systemType (str): Type of the system (currently only "dimer" is supported).
@@ -727,19 +900,23 @@ def make_train_val_ds(r_next_norm, c_norm, weights, n_timesteps, n_datasets, L, 
     # --- hyper-params ---
     stride = 1          # set to 2, 3, 5, ... to subsample in time
             
-    if systemType == "dimer":
-        # full time length per trajectory in the *original* dataset divided by 2
+    if systemType in ("dimer", "bistable"):
+        # Number of r_{n+1} pairs per trajectory produced by the construct_rc_*
+        # builders (they drop get_nlags(conditionedOn) leading steps). For dimer
+        # the caller already passes the per-particle time length (T_full // 2).
         T_full = n_timesteps
-        T_eff = T_full - get_nlags(cond_type)
+        T_eff = T_full - get_nlags(conditionedOn)
 
     else:
-        raise ValueError('only dimer system')
+        raise ValueError(f"Unknown systemType={systemType!r}; expected 'dimer' or 'bistable'.")
 
     # reshape flat arrays → [n_datasets, T_eff, ...]
     r_next_traj = r_next_norm.view(n_datasets, T_eff, -1)
     c_traj      = c_norm.view(n_datasets, T_eff, -1)
     w_traj      = weights.view(n_datasets, T_eff, -1)
-
+    
+    if y is not None:
+        y_traj      = y.view(n_datasets, T_eff, -1)
     # Sliding-window dataset: sequences of length L
     split_traj = int(0.8 * n_datasets)
 
@@ -747,6 +924,7 @@ def make_train_val_ds(r_next_norm, c_norm, weights, n_timesteps, n_datasets, L, 
         r_next_traj[:split_traj],   # [N_train, T_eff_strided, 3]
         c_traj[:split_traj],        # [N_train, T_eff_strided, cdim]
         w_traj[:split_traj],
+        y_traj[:split_traj] if y is not None else None,
         L=L,
         step=stride
     )
@@ -754,6 +932,7 @@ def make_train_val_ds(r_next_norm, c_norm, weights, n_timesteps, n_datasets, L, 
         r_next_traj[split_traj:],
         c_traj[split_traj:],
         w_traj[split_traj:],
+        y_traj[split_traj:] if y is not None else None,
         L=L,
         step=stride
     )
@@ -763,15 +942,73 @@ def make_train_val_ds(r_next_norm, c_norm, weights, n_timesteps, n_datasets, L, 
 def get_nlags(cond_type):
     """ Return the number of previous timesteps included in a given conditioning type."""
 
-    if cond_type == "piri":
+    if cond_type in ("piri", "local_dqipiri", "local_piri", "local_dqipi"):
         return 1
-    elif cond_type in ("pipimririm", "pipimdqiririm", 
-                    "local_pipimririm", "local_dqipipimririm", "local_dqidpipipimririm"):
+    elif cond_type in ("piririm", "pipimri", "pipimririm", "pipimdqiririm",
+                    "local_pipimririm", "local_dqipipimririm", "local_dqidpipipimririm",
+                    "ririm", "local_dqiririm",    # velocity-free (E5)
+                    "local_dqipiririm"):          # no v^{n-1} (E15)
         return 2
-    elif cond_type in ("pimmrimm", "local_dqidpipimmrimm"):
+    elif cond_type in ("piririmrimm", "pimmrimm", "local_dqidpipimmrimm"):
         return 3
+    elif cond_type in ("piririmrimmriM",):
+        return 4
     else:
         raise ValueError(f'Undefined conditioning. Set the correct lag number for {cond_type}')
+
+
+# MDN Utilities
+
+def make_component_target_r1_r2(r_next, r_star=0.081, r_max=0.1):
+    """
+    r_next: [B, 6] in physical units
+
+    returns:
+        y_comp: [B] long
+            0 = main
+            1 = r1 bump
+            2 = r2 bump
+    """
+    r1_norm = torch.linalg.norm(r_next[..., :3], dim=-1)
+    r2_norm = torch.linalg.norm(r_next[..., 3:6], dim=-1)
+
+    r1_bump = r1_norm > r_star
+    r2_bump = r2_norm > r_star
+
+    if r_max is not None:
+        r1_bump = r1_bump & (r1_norm <= r_max)
+        r2_bump = r2_bump & (r2_norm <= r_max)
+
+    y_comp = torch.zeros(r_next.shape[0], device=r_next.device, dtype=torch.long)
+
+    # If only r1 is bump
+    y_comp[r1_bump & ~r2_bump] = 1
+
+    # If only r2 is bump
+    y_comp[r2_bump & ~r1_bump] = 2
+
+    # Rare ambiguous case: both are bump.
+    # Assign to the larger one.
+    both = r1_bump & r2_bump
+    y_comp[both & (r1_norm >= r2_norm)] = 1
+    y_comp[both & (r2_norm > r1_norm)] = 2
+    
+    print(
+        "main fraction:", (y_comp == 0).float().mean().item(),
+        "r1 bump:", torch.sum(y_comp == 1).item(),
+        "r2 bump:", torch.sum(y_comp == 2).item(),
+        "both raw:", torch.sum(both).item(),
+    )
+    return y_comp
+
+
+
+
+
+
+
+
+
 
 # Not used for now (will clean up later)
 
@@ -859,7 +1096,8 @@ def aboba_deterministic_step(q_n, v_n, dt_eff, Gamma, mass,
     return q_next, v_det
 
 def compute_r_cg_from_fine(q, v, k, parameters,
-                           boxsize=5.0, scale=1.0):
+                           boxsize=5.0, scale=1.0,
+                           minimaDist=None, kconstants=None):
     """
     Compute coarse-grained interaction noise r_cg from fine benchmark trajectories,
     using the same ABOBA scheme as langevinNoiseSampler but *without* noise.
@@ -868,9 +1106,11 @@ def compute_r_cg_from_fine(q, v, k, parameters,
     dt   : fine timestep
     k : integer k (dt_eff = k * dt)
 
-    Gamma, mass       : friction and mass
-    minimaDist        : bistable parameter
-    kconstants        : (3,) for bistable (kx, ky, kz)
+    Gamma, mass       : friction and mass, read from `parameters`
+    minimaDist        : bistable parameter; defaults to `parameters['minimaDist']`
+                        if present, else 1.5
+    kconstants        : (3,) for bistable (kx, ky, kz); defaults to
+                        `parameters['kconstants']` if present, else [1, 1, 1]
     boxsize           : scalar or (3,) – periodic box, interval [-L/2, L/2]
     scale             : scale factor for the potential
 
@@ -882,10 +1122,20 @@ def compute_r_cg_from_fine(q, v, k, parameters,
     assert q.shape == v.shape
     assert q.ndim == 3 and q.shape[-1] == 3, "q, v must be [n_traj, T, 3]"
     assert k >= 1
-    
+
     dt = parameters['dt']
     Gamma = parameters['Gamma']
     mass = parameters['mass']
+
+    # The bistable potential shape is not recorded in the benchmark `parameters`
+    # file, so fall back to the values every generator script uses
+    # (scripts/stochasticClosure*/**/benchmark*Bistable*.py: minimaDist = 1.5,
+    # kconstants = [1, 1, 1], scalefactor = 1). Passing them explicitly, or
+    # adding them to `parameters`, overrides the fallback.
+    if minimaDist is None:
+        minimaDist = parameters.get('minimaDist', 1.5)
+    if kconstants is None:
+        kconstants = parameters.get('kconstants', [1.0, 1.0, 1.0])
 
     n_traj, T, _ = q.shape
     

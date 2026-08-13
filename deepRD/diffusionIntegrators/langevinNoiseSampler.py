@@ -69,6 +69,10 @@ class langevinNoiseSampler(langevin):
             return np.concatenate((particle.nextVelocity, particle.aux1, particle.aux2))
         elif self.conditionedOn == 'piririmrimm':
             return np.concatenate((particle.nextVelocity, particle.aux1, particle.aux2, particle.aux4))
+        elif self.conditionedOn == 'piririmrimmriM':
+            # four auxiliary lags: r^n, r^{n-1}, r^{n-2}, r^{n-3}
+            return np.concatenate((particle.nextVelocity, particle.aux1, particle.aux2,
+                                   particle.aux4, particle.aux5))
         elif self.conditionedOn == 'qipi':
             return ((particle.nextPosition, particle.nextVelocity))
         elif self.conditionedOn == 'qipiri':
@@ -110,6 +114,11 @@ class langevinNoiseSampler(langevin):
             #xi = np.sqrt(self.kBT * particle.mass * (1 - np.exp(-2 * self.Gamma * dt / particle.mass)))
             #interactionNoiseTerm = xi / particle.mass * np.random.normal(0., 1, particle.dimension)
 
+            # r-lag shift chain. Deepest lag first: aux5 must take the OLD aux4
+            # before aux4 is overwritten, exactly as langevinNoiseSamplerDimerGlobal
+            # already does. After the chain, aux1 = r^{n+1}, aux2 = r^n,
+            # aux4 = r^{n-1}, aux5 = r^{n-2}.
+            particle.aux5 = 1.0 * particle.aux4
             particle.aux4 = 1.0 * particle.aux2
             particle.aux3 = 1.0 * particle.nextVelocity
             particle.aux2 = 1.0 * particle.aux1
@@ -803,12 +812,24 @@ class langevinNoiseSamplerDimerGlobal(langevinNoiseSamplerDimer):
         elif self.conditionedOn=='piridqi':
             return np.concatenate((particle1.nextVelocity, particle2.nextVelocity, particle1.aux1, particle2.aux1, np.array([self.relDistance[index]])))
         # Conditionings that utilise a transformation to dimer's local system 
-        elif self.conditionedOn in ('local_dqipiri','local_dqipiwiri', 'local_abs_dqipiri'):
+        elif self.conditionedOn in ('local_dqipiri','local_dqipiwiri', 'local_abs_dqipiri', 'local_piri'):
             return np.concatenate((particle1.nextPosition, particle2.nextPosition, particle1.nextVelocity, particle2.nextVelocity, particle1.aux1, particle2.aux1))
+        elif self.conditionedOn == 'local_dqiririm':
+            # velocity-free (E5): positions (for the frame and dx) then the two
+            # auxiliary lags. No velocity is passed -- that is the experiment.
+            return np.concatenate((particle1.nextPosition, particle2.nextPosition,
+                                   particle1.aux1, particle2.aux1,
+                                   particle1.aux2, particle2.aux2))
+        elif self.conditionedOn == 'local_dqipi':
+            return np.concatenate((particle1.nextPosition, particle2.nextPosition, particle1.nextVelocity, particle2.nextVelocity))
         elif self.conditionedOn in ('local_pipimririm', 'inv_pipimririm', 'E3_base'):
             return np.concatenate((particle1.nextPosition, particle2.nextPosition, particle1.nextVelocity, particle2.nextVelocity, particle1.aux3, particle2.aux3, particle1.aux1, particle2.aux1, particle1.aux2, particle2.aux2))
         elif self.conditionedOn in ('local_dqipipimririm'):
             return np.concatenate((particle1.nextPosition, particle2.nextPosition, np.array([self.relDistance[index]]), particle1.nextVelocity, particle2.nextVelocity, particle1.aux3, particle2.aux3, particle1.aux1, particle2.aux1, particle1.aux2, particle2.aux2))
+        elif self.conditionedOn == 'local_dqipiririm':
+            # E15: local_dqipipimririm minus the v^{n-1} block (aux3). Same
+            # element order otherwise, so the model-side branch is shared.
+            return np.concatenate((particle1.nextPosition, particle2.nextPosition, np.array([self.relDistance[index]]), particle1.nextVelocity, particle2.nextVelocity, particle1.aux1, particle2.aux1, particle1.aux2, particle2.aux2))
         elif self.conditionedOn in ('local_dqidpipipimririm'):
             return np.concatenate((particle1.nextPosition, particle2.nextPosition, np.array([self.relDistance[index]]), np.array([self.axisRelVelocity[index]]), particle1.nextVelocity, particle2.nextVelocity, particle1.aux3, particle2.aux3, particle1.aux1, particle2.aux1, particle1.aux2, particle2.aux2))
         elif self.conditionedOn in ('local_dqidpipimmrimm'):
@@ -864,8 +885,8 @@ class langevinNoiseSamplerDimerGlobal(langevinNoiseSamplerDimer):
             self.axv1 = self.axisRelVelocity
 
             # r terms update
-            #particleList[2*i].aux5 = 1.0 * particleList[2*i].aux4
-            #particleList[2*i+1].aux5 = 1.0 * particleList[2*i+1].aux4
+            particleList[2*i].aux5 = 1.0 * particleList[2*i].aux4
+            particleList[2*i+1].aux5 = 1.0 * particleList[2*i+1].aux4
 
             particleList[2*i].aux4 = 1.0 * particleList[2*i].aux2
             particleList[2*i+1].aux4 = 1.0 * particleList[2*i+1].aux2
@@ -877,8 +898,8 @@ class langevinNoiseSamplerDimerGlobal(langevinNoiseSamplerDimer):
             particleList[2*i+1].aux1 = interactionNoiseTerm2
 
             # Velocity terms update
-            #particleList[2 * i].vel2 = 1.0 * particleList[2*i].vel1
-            #particleList[2 * i + 1].vel2 = 1.0 * particleList[2*i+1].vel1
+            particleList[2 * i].vel2 = 1.0 * particleList[2*i].vel1
+            particleList[2 * i + 1].vel2 = 1.0 * particleList[2*i+1].vel1
 
             particleList[2 * i].vel1 = 1.0 * particleList[2*i].aux3
             particleList[2 * i + 1].vel1 = 1.0 * particleList[2*i+1].aux3

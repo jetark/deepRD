@@ -11,11 +11,16 @@ def load_run(run_dir, map_location="cpu"):
 
     config = load_config(run_dir / "config.yaml")
 
-    with open(run_dir / config.paths.scaler_name, "rb") as f:
-        scalers = pickle.load(f)
+    scaler_path = run_dir / config.paths.scaler_name
+    try:
+        with open(scaler_path, "rb") as f:
+            scalers = pickle.load(f)
+    except Exception:
+        import joblib
+        scalers = joblib.load(scaler_path)
 
     model = build_model_from_config(config)
-    checkpoint = torch.load(run_dir / config.paths.checkpoint_name, map_location=map_location)
+    checkpoint = torch.load(run_dir / config.paths.checkpoint_name, map_location=map_location, weights_only=True)
     state_dict = checkpoint["model_state"] if isinstance(checkpoint, dict) and "model_state" in checkpoint else checkpoint
     model.load_state_dict(state_dict, strict=False)
     model.attach_normalizers(**scalers)
@@ -54,11 +59,19 @@ def create_run_dir(config_or_path: CVAEConfig | str | Path, output_root: str | P
         run_stem = config_path.stem
         root = Path(output_root or config.paths.output_root)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = run_stem + "_" + timestamp
+    conditioning = config.data.conditioning if hasattr(config.data, "conditioning") else ValueError("The configuration does not have a 'conditioning' attribute.")
 
-    run_dir = root / run_name
-    run_dir.mkdir(parents=True, exist_ok=False)
+    cond_dir = root / conditioning
+    cond_dir.mkdir(parents=True, exist_ok=True)
+
+    existing = [
+        p for p in cond_dir.iterdir()
+        if p.is_dir() and p.name[:3].isdigit()
+    ]
+
+    run_num = len(existing) + 1
+    run_dir = cond_dir / f"{run_num:03d}_{run_stem}"
+    run_dir.mkdir()
 
     if isinstance(config_or_path, CVAEConfig):
         save_config(config, run_dir / "config.yaml")

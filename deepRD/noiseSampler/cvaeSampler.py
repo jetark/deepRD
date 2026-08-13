@@ -89,8 +89,13 @@ class CVAE_LF(CVAESampler):
             "dimer": {
                 "local_pipimririm": 24,
                 "local_dqipipimririm": 25,
+                "local_dqipiririm": 19,   # no v^{n-1} (E15)
                 "local_dqidpipipimririm": 26,
-                "local_dqidpipimmrimm": 38
+                "local_dqidpipimmrimm": 38,
+                "local_dqipiri": 13,
+                "local_dqiririm": 13,   # velocity-free (E5): dx + r^n + r^{n-1}
+                "local_piri": 12,
+                "local_dqipi": 7,
             },
         }
 
@@ -226,8 +231,14 @@ class CVAE_LF(CVAESampler):
 
         # Converting to local frame
         if self.cond_type=='local_pipimririm':
+            # no dq in this cond_type's conditioning either; set it only to
+            # satisfy the shared sanity check below (pre-existing bug fixed
+            # here -- this branch previously left `dq` unbound, which was
+            # never hit because no rollout had exercised this cond_type
+            # before).
+            dq = bond_len[:, None]
             c_loc_t = to_local(R, c_t)
-        elif self.cond_type=='local_dqipipimririm':
+        elif self.cond_type in ('local_dqipipimririm', 'local_dqipiririm'):
             # first coordinate "after"
             dq = c_t[..., 0:1]
             c_loc_t = torch.cat((dq, to_local(R, c_t[..., 1:])), dim=-1)
@@ -238,6 +249,34 @@ class CVAE_LF(CVAESampler):
             dq = c_t[..., 0:1]
             dp = c_t[..., 1:2]
             c_loc_t = torch.cat((dq, dp, to_local(R, c_t[..., 2:])), dim=-1)
+
+        elif self.cond_type == 'local_dqipiri':
+            # no separate dq label is passed for this cond_type (the
+            # integrator's raw return has no relDistance element) — dq IS
+            # bond_len by construction, so the allclose check below passes
+            # trivially (same tensor).
+            dq = bond_len[:, None]
+            c_loc_t = torch.cat((dq, to_local(R, c_t)), dim=-1)
+
+        elif self.cond_type == 'local_dqiririm':
+            # velocity-free (E5). Raw state carries no relDistance element, so
+            # dq IS bond_len by construction and the check below is trivially
+            # satisfied -- same convention as local_dqipiri.
+            dq = bond_len[:, None]
+            c_loc_t = torch.cat((dq, to_local(R, c_t)), dim=-1)
+
+        elif self.cond_type == 'local_piri':
+            # raw state is [q1,q2,v1,v2,r1,r2] (same as local_dqipiri) but dq
+            # is dropped from the conditioning entirely; dq is only set here
+            # to satisfy the shared sanity check below.
+            dq = bond_len[:, None]
+            c_loc_t = to_local(R, c_t)
+
+        elif self.cond_type == 'local_dqipi':
+            # raw state is [q1,q2,v1,v2] (no r) — the integrator branch for
+            # this cond_type returns a leaner state since r isn't used.
+            dq = bond_len[:, None]
+            c_loc_t = torch.cat((dq, to_local(R, c_t)), dim=-1)
 
         if not torch.allclose(dq, bond_len[:, None], rtol=1e-4, atol=1e-5):
             raise ValueError(
@@ -416,7 +455,41 @@ class CVAESampler_E3(models.CVAE_E3):
 
 # ---------- CVAE ----------
 class CVAE_SP(CVAESampler):
-    
+    """
+    Standard Gaussian prior CVAE
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # The base CVAE builds a learned-prior MLP (self.prior). This model uses a
+        # fixed N(0, I) prior (prior_params overridden below), so that network is
+        # never used in forward() or sampling. Drop it so it isn't carried as dead
+        # parameters in checkpoints.
+        if hasattr(self, "prior"):
+            del self.prior
+
+    def prior_params(self, c=None, batch_shape=None, device=None, dtype=None):
+        """
+        Standard Gaussian prior:
+
+            p(z) = N(0, I)
+
+        Returns p_mu = 0, p_logvar = 0.
+
+        c is accepted only for API compatibility with the learned-prior version.
+        """
+        if c is not None:
+            shape = (*c.shape[:-1], self.zdim)
+            device = c.device
+            dtype = c.dtype
+        else:
+            assert batch_shape is not None, "Need either c or batch_shape."
+            shape = (*batch_shape, self.zdim)
+
+        p_mu = torch.zeros(shape, device=device, dtype=dtype)
+        p_logvar = torch.zeros(shape, device=device, dtype=dtype)
+        return p_mu, p_logvar
+
     # ----- sampling ----- #
     @torch.no_grad()
     def sample_torch(self, c, Tr=1.0, Tz=1.0, return_stats=False):
