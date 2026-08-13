@@ -1,0 +1,58 @@
+experiment:
+  name: e3_dimer_capacity
+  seed: 302
+  frame: global
+system:
+  system_type: dimer
+  boxsize: 5.0
+  dt: 0.05
+  step: 1
+data:
+  conditioning: dqpipimririm
+  n_lags: 1
+  train_trajectories: 200
+  val_fraction: 0.2
+  dataset_dir: /group/ag_cmb/scratch/maojrs/stochasticClosure/dimer/boxsize5/benchmark/
+  total_trajectories: 2500
+  scaler_type: e3_vector_rms
+  weights: none
+model:
+  model_type: E3DimerCVAE
+  input_dim: 6
+  latent_dim: 3
+  cond_dim: 0
+  hidden_dims: []
+  activation: silu
+  layer_norm: true
+  standard_prior: true
+  hidden_irreps: 32x0e + 16x1o + 8x2e
+  isotropic: false
+  lag2: false
+  n_dec_layers: 4
+  dec_nonlinear_head: false
+  add_dx_scalar: false
+  radial_num_basis: 16
+  r_cut: 2.0
+  lmax: 2
+training:
+  batch_size: 2048
+  epochs: 50
+  learning_rate: 0.001
+  beta_max: 1.0
+  beta_warmup_epochs: 10
+  window_length: 1
+  free_bits: 0.0
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  early_stopping: true
+  patience: 5
+  min_delta: 0.001
+  validate_every: 1
+  weights_for_training: false
+  num_workers: 0
+  lambda_gate: null
+  lambda_comp: null
+paths:
+  output_root: deepRD/noiseSampler/training/results_e3/repro_s302
+  checkpoint_name: checkpoint.pt
+  scaler_name: e3_normalizer.json

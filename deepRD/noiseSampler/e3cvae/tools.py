@@ -3,7 +3,7 @@ from e3nn import o3
 from torch.utils.data import Dataset
 from deepRD.noiseSampler.cvae.transforms import minimal_image_rel
 
-def radial_embedding(edge_vec, num_basis=16, r_cut=5.0):
+def radial_embedding(edge_vec, num_basis=16, r_cut=2.0):
     "Embedding for the edge vector."
     r = edge_vec.norm(dim=-1, keepdim=True)
     centers = torch.linspace(0.0, r_cut, num_basis, device=edge_vec.device)
@@ -185,17 +185,30 @@ def build_dimer_graph_batch(
     v2_prev2=None,
     r1_prev2=None,
     r2_prev2=None,
+    add_dx_scalar=False,
+    radial_num_basis=16,
+    r_cut=2.0,
 ):
     """
     Shapes:
         q1, q2, v1, ...: [B, 3]
     Returns graph tensors for B two-node graphs.
     Pass v*_prev2 and r*_prev2 to enable lag-2 conditioning.
+
+    Featurisation options (equivariance-preserving; default = legacy behaviour):
+      add_dx_scalar    : append the bond length dx=|q1-q2| as a direct invariant
+                         scalar node feature (both nodes share it). Gives the
+                         decoder sharp, direct access to dx (cf. DAG2's dx input).
+      radial_num_basis : number of Gaussian radial-embedding bases for dx (was 16).
+      r_cut            : radial-embedding cutoff (was 2.0).
     """
 
     B = q1.shape[0]
     device = q1.device
     lag2 = v1_prev2 is not None
+
+    x12 = minimal_image_rel(q1, q2, boxsize=boxsize)
+    dx = x12.norm(dim=-1, keepdim=True)                       # [B,1]
 
     # Base: 4 per-node vectors (v_n, v_nm1, r_n, r_nm1); lag2 adds v_nm2 and r_nm2
     dec_vecs = [
@@ -213,13 +226,19 @@ def build_dimer_graph_batch(
     # Node-wise vectors: [B, 2, num_vecs, 3] → flatten → [B*2, num_vecs, 3]
     vec_dec = torch.stack(dec_vecs, dim=2).reshape(B * 2, len(dec_vecs), 3)
 
+    dx_node = dx.repeat_interleave(2, dim=0) if add_dx_scalar else None  # [2B,1]
+
     scal_dec = vec_dec.norm(dim=-1)
+    if add_dx_scalar:
+        scal_dec = torch.cat([scal_dec, dx_node], dim=-1)
     h_dec_base = pack_e3_features(scal_dec, vec_dec)
 
     if r1_next is not None:
         target = torch.stack([r1_next, r2_next], dim=1).reshape(B * 2, 3)
         vec_enc = torch.cat([vec_dec, target[:, None, :]], dim=1)
         scal_enc = vec_enc.norm(dim=-1)
+        if add_dx_scalar:
+            scal_enc = torch.cat([scal_enc, dx_node], dim=-1)
         h_enc = pack_e3_features(scal_enc, vec_enc)
     else:
         target = None
@@ -232,10 +251,9 @@ def build_dimer_graph_batch(
     dst = torch.cat([node_offset + 1, node_offset + 0], dim=0)
     edge_index = torch.stack([src, dst], dim=0)
 
-    x12 = minimal_image_rel(q1, q2, boxsize=boxsize)
     edge_vec = torch.cat([x12, -x12], dim=0)
 
-    edge_radial = radial_embedding(edge_vec)
+    edge_radial = radial_embedding(edge_vec, num_basis=radial_num_basis, r_cut=r_cut)
     bond_unit = x12 / x12.norm(dim=-1, keepdim=True).clamp_min(1e-12)
     bond_unit_node = bond_unit.repeat_interleave(2, dim=0)
 

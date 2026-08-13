@@ -3,7 +3,12 @@ import torch
 import torch.optim as optim
 from tqdm import tqdm
 
-from .losses import e3_cvae_axial_loss, e3_cvae_isotropic_loss
+from .losses import (
+    e3_cvae_axial_loss,
+    e3_cvae_isotropic_loss,
+    fluctuation_dissipation_penalty,
+    joint_fd_penalty,
+)
 
 
 def move_graph_batch_to_device(batch, device):
@@ -41,6 +46,14 @@ def train_e3_cvae(
     validate_every=1,
     device="cpu",
     free_bits=0.0,
+    lambda_fd=0.0,
+    lambda_fd_joint=0.0,
+    fd_nbins=8,
+    fd_w_par=3.0,
+    fd_w_perp=1.0,
+    fd_w_com=1.0,
+    fd_w_var=1.0,
+    fd_w_cov=1.0,
 ):
     """
     Train E3DimerCVAE on graph batches.
@@ -78,7 +91,7 @@ def train_e3_cvae(
         beta = beta_schedule(epoch, beta_max=beta_max, warmup_epochs=warmup_epochs)
         model.train()
 
-        total_loss = total_nll = total_kl = 0.0
+        total_loss = total_nll = total_kl = total_fd = 0.0
         loop = tqdm(train_loader, desc=f"E3 epoch {epoch}/{epochs}")
         for batch in loop:
             batch = move_graph_batch_to_device(batch, device)
@@ -87,6 +100,18 @@ def train_e3_cvae(
             outputs = model(batch)
             loss_fn = e3_cvae_isotropic_loss if model.isotropic else e3_cvae_axial_loss
             loss, nll, kl = loss_fn(outputs, batch, beta=beta, free_bits=free_bits)
+            if lambda_fd > 0.0:
+                fd_pen = fluctuation_dissipation_penalty(outputs, batch)
+                loss = loss + lambda_fd * fd_pen
+                total_fd += fd_pen.item()
+            if lambda_fd_joint > 0.0:
+                jfd_pen = joint_fd_penalty(
+                    outputs, batch, nbins=fd_nbins,
+                    w_par=fd_w_par, w_perp=fd_w_perp, w_com=fd_w_com,
+                    w_var=fd_w_var, w_cov=fd_w_cov,
+                )
+                loss = loss + lambda_fd_joint * jfd_pen
+                total_fd += jfd_pen.item()
             loss.backward()
 
             if grad_clip is not None:
@@ -113,9 +138,11 @@ def train_e3_cvae(
         history["train_nll"].append(avg_nll)
         history["train_kl"].append(avg_kl)
 
+        avg_fd = total_fd / len(train_loader)
         print(
             f"Epoch {epoch}: train_total={avg_loss:.4f}, "
-            f"train_nll={avg_nll:.4f}, train_kl={avg_kl:.4f}, beta={beta:.4f}"
+            f"train_nll={avg_nll:.4f}, train_kl={avg_kl:.4f}, "
+            f"train_fd={avg_fd:.3e}, beta={beta:.4f}"
         )
 
         if val_loader is not None and epoch % validate_every == 0:

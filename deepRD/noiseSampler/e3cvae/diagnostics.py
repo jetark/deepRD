@@ -50,7 +50,7 @@ def load_trained_model(run_dir: Path, device: torch.device):
     config = load_config(run_dir / "config.yaml")
     normalizer = E3VectorNormalizer.load_json(run_dir / config.paths.scaler_name)
     model = build_model_from_config_e3(config).to(device)
-    checkpoint = torch.load(run_dir / config.paths.checkpoint_name, map_location=device)
+    checkpoint = torch.load(run_dir / config.paths.checkpoint_name, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     return config, normalizer, model, checkpoint
@@ -384,6 +384,9 @@ class E3DimerRolloutSampler:
         self.device = device
         self.Tr = Tr
         self.Tz = Tz
+        # mirror the model's input featurisation (dx scalar / radial resolution) so
+        # rollout graphs match how the model was trained (default = legacy).
+        self.feat = model.graph_featurisation() if hasattr(model, "graph_featurisation") else {}
 
     @torch.no_grad()
     def sample(self, conditioned_vars):
@@ -419,6 +422,7 @@ class E3DimerRolloutSampler:
             r1_prev=structured["r1_nm1"],
             r2_prev=structured["r2_nm1"],
             boxsize=self.boxsize,
+            **self.feat,
         )
         batch = move_graph_batch_to_device(batch, self.device)
         r_norm, _, _ = self.model.sample_torch(batch, Tr=self.Tr, Tz=self.Tz)
@@ -480,6 +484,7 @@ class E3Lag2RolloutSampler(E3DimerRolloutSampler):
             v2_prev2=structured["v2_nm2"],
             r1_prev2=structured["r1_nm2"],
             r2_prev2=structured["r2_nm2"],
+            **self.feat,
         )
         batch = move_graph_batch_to_device(batch, self.device)
         r_norm, _, _ = self.model.sample_torch(batch, Tr=self.Tr, Tz=self.Tz)

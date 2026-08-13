@@ -5,13 +5,6 @@ from e3nn import o3
 from e3nn.nn import NormActivation
 
 
-def radial_embedding(edge_vec, num_basis=16, r_cut=5.0):
-    "Embedding for the edge vector."
-    r = edge_vec.norm(dim=-1, keepdim=True)
-    centers = torch.linspace(0.0, r_cut, num_basis, device=edge_vec.device)
-    widths = (r_cut / num_basis)
-    return torch.exp(-((r - centers) ** 2) / (widths ** 2))
-
 class RadialMLP(nn.Module):
     def __init__(self, in_dim, hidden_dim, out_dim):
         super().__init__()

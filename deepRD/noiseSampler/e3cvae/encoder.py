@@ -21,18 +21,21 @@ def extract_0e(x, irreps):
     return torch.cat(parts, dim=-1)
 
 class E3InvariantEncoder(nn.Module):
-    def __init__(self, zdim, hidden_irreps="32x0e + 16x1o + 8x2e", lag2=False):
+    def __init__(self, zdim, hidden_irreps="32x0e + 16x1o + 8x2e", lag2=False,
+                 n_layers=2, radial_num_basis=16, radial_hidden=64, n_extra_scalars=0, lmax=2):
         super().__init__()
 
-        # Base: 5 vector inputs (v_n, v_nm1, r_n, r_nm1, r_next); lag2 adds v_nm2 and r_nm2
+        # Base: 5 vector inputs (v_n, v_nm1, r_n, r_nm1, r_next); lag2 adds v_nm2 and r_nm2.
+        # Scalars: one norm per vector + n_extra_scalars (e.g. dx).
         n_vecs = 7 if lag2 else 5
-        self.irreps_in = o3.Irreps(f"{n_vecs}x1o + {n_vecs}x0e")
+        self.irreps_in = o3.Irreps(f"{n_vecs}x1o + {n_vecs + n_extra_scalars}x0e")
         self.irreps_hidden = o3.Irreps(hidden_irreps)
 
-        self.layers = nn.ModuleList([
-            E3MessageLayer(self.irreps_in, self.irreps_hidden, lmax=2),
-            E3MessageLayer(self.irreps_hidden, self.irreps_hidden, lmax=2),
-        ])
+        mlk = dict(lmax=lmax, radial_dim=radial_num_basis, radial_hidden=radial_hidden)
+        layers = [E3MessageLayer(self.irreps_in, self.irreps_hidden, **mlk)]
+        for _ in range(int(n_layers) - 1):
+            layers.append(E3MessageLayer(self.irreps_hidden, self.irreps_hidden, **mlk))
+        self.layers = nn.ModuleList(layers)
 
         scalar_dim = extract_0e(
             torch.zeros(1, self.irreps_hidden.dim),
